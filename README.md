@@ -387,7 +387,7 @@ GatedPulsePico/
   secrets.h.example      copy to secrets.h for WiFi
 HARDWARE.md              pin map, wiring, what every knob does
 AMPLITUDE_SEQUENCING.md  driving a VIC, amplitude control, HV parts
-docs/BRINGUP_NOTES.md    development notes, kept for the findings in them
+docs/DESIGN_NOTES.md     why the firmware is built this way; PIO gotchas
 tools/pioverify.py       proves the PIO encodings match their sources
 ```
 
@@ -422,7 +422,7 @@ Two things in the timing are worth knowing before you change the PIO:
   comes from the group's configured `OUT_COUNT`, not the instruction's bit
   count, so a narrow OUT zero-fills the rest of the group. This contradicts the
   natural reading of the instruction set and cost a bench session to find; see
-  [docs/BRINGUP_NOTES.md](docs/BRINGUP_NOTES.md) §7.
+  [docs/DESIGN_NOTES.md](docs/DESIGN_NOTES.md).
 
 ## License
 

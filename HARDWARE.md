@@ -2,8 +2,8 @@
 
 The board is a complete instrument on its own. Flash it, wire three encoders and
 two switches, and you have a gated pulse generator with a front panel — no
-computer, no WiFi, no dashboard. Everything else in this repo is optional on top
-of that.
+computer, no WiFi, nothing else to install. The optional WiFi web UI below
+layers on top of that; it does not replace any of it.
 
 ## Minimum build
 
@@ -203,9 +203,9 @@ and survives a shorted load.
 
 ## Serial
 
-USB serial at any baud, `?` for help. This works with no WiFi and no dashboard —
-a terminal is enough to reach every feature the knobs expose and several they
-don't (`SEQ`, `TRAIN`, `RAMP1/2`).
+USB serial at any baud, `?` for help. This works with no WiFi at all — a
+terminal is enough to reach every feature the knobs expose and several they
+don't (`SEQ`, `TRAIN`, `RAMP1/2`, `INPUTS`).
 
 ## Optional: amplitude / tap select
 
@@ -232,5 +232,8 @@ that file the firmware still builds and runs — it just stays offline, which is
 the standalone case above. The include is guarded by `__has_include`, so a
 missing `secrets.h` is not a compile error.
 
-With WiFi it serves its own small web UI and a JSON endpoint at the address it
-prints to serial on boot, and the dashboard in this repo can find it.
+With WiFi it serves its own web UI and a JSON endpoint at the address it prints
+to serial on boot — faders for the carrier and the train ring, a live front-panel
+wiring checker, and every command the serial console takes. Nothing to install
+on the phone or PC, and nothing is fetched from the internet, so it works on an
+isolated workshop network.
