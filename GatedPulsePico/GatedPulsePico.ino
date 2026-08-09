@@ -2375,10 +2375,15 @@ static void runCommand(char *s, Print &o) {
     // symptom is silence with every setting looking correct. Defaults must
     // land somewhere that actually pulses.
     sigSource = SRC_INT; outputEnabled = true;
-    phaseMode = PH_OFF;
+    // ROTATE 3, not OFF. "Known state" exists to be pressed when nothing is
+    // coming out -- and single mode idles GP18-20 and the GP22 marker, so
+    // resetting into it silently kills four of the five pins anyone is likely
+    // to have a probe on. Landing here lights every output at once: the three
+    // channels, the cycle marker, and GP5 which carries the train regardless.
+    phaseMode = PH_ROTATE; phaseLen = 3;
     applyGate();
     inLogAction("reset to known state");
-    o.println("defaults restored -- 100 kHz / 50%, 10 on / 90 off, output ON");
+    o.println("defaults restored -- 100 kHz / 50%, 10 on / 90 off, offset x3, output ON");
     printState(o); return;
   }
 

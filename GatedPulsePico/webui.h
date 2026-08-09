@@ -149,7 +149,7 @@ body.count .timeonly,body.time .countonly{display:none}
    <div class=hact>
     <button onclick="c('SHOT')">single burst</button>
     <button class=acc onclick="c('SAVE')">save</button>
-    <button class=warn onclick="c('R')" title="100 kHz / 50%, 10 on / 90 off, internal carrier, everything else off, output ON">known state</button>
+    <button class=warn onclick="c('R')" title="100 kHz / 50%, 10 on / 90 off, internal carrier, offset x3 so GP18-20 and GP22 are all live, output ON">known state</button>
    </div>
   </div>
  </div>

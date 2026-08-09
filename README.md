@@ -224,9 +224,13 @@ channels, shape, train, panel and system.
 Two things there are worth knowing about before you need them:
 
 **`known state`** in the header — one click, no dialog. 100 kHz / 50 %, 10 on /
-90 off, internal carrier, everything else off, output on. When you have been
-turning knobs for an hour and nothing comes out, press this before debugging
-anything.
+90 off, internal carrier, elongation and sweep and seq and train all off,
+**offset ×3**, output on. When you have been turning knobs for an hour and
+nothing comes out, press this before debugging anything.
+
+It deliberately lands on offset ×3 rather than single, so GP18–20 *and* the
+GP22 cycle marker all come alive — single mode idles four of the five pins you
+are most likely to have a probe on, which makes a reset look like a failure.
 
 **The `panel` tab** is a live wiring check, described in §7 below. The activity
 log it feeds sits at the bottom of *every* tab, so you can watch a knob move the
