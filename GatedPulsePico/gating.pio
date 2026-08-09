@@ -1,0 +1,42 @@
+; Both gating engines in one relocatable program so dynamic PIO claiming can
+; never split them across blocks. COUNT entry = offset+0, TIME entry = +17.
+;
+; SET pin group differs per mode (configured on the SM, not here):
+;   COUNT: base GP4, count 2  -> bit0 = burst marker, bit1 = gated output
+;   TIME : base GP5, count 1  -> bit0 = gated output
+.program gating
+
+; ---- COUNT: pass ON input pulses, mute OFF input pulses ----
+    pull block              ; OSR = OFF-1
+    mov  isr, osr           ; stash OFF
+    pull block              ; OSR = ON-1  (stays here)
+    wait 0 pin 0            ; sync: begin from a low input
+burst:
+    mov  x, osr             ; reload ON count
+    set  pins, 1            ; marker high, output low
+pass:
+    wait 1 pin 0
+    set  pins, 3            ; output follows input
+    wait 0 pin 0
+    set  pins, 1
+    jmp  x--, pass
+    set  pins, 0            ; burst over, marker low
+    mov  y, isr             ; reload OFF count
+mute:
+    wait 1 pin 0
+    wait 0 pin 0
+    jmp  y--, mute
+    jmp  burst
+
+; ---- TIME: AND the input with a gate level read through JMP_PIN ----
+tloop:
+    jmp  pin, topen
+    set  pins, 0            ; gate shut, hold low
+    jmp  tloop
+topen:
+    wait 0 pin 0            ; only ever start a pulse from a low input
+    wait 1 pin 0
+    set  pins, 1
+    wait 0 pin 0
+    set  pins, 0
+    jmp  tloop

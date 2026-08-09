@@ -1,0 +1,22 @@
+# Your WiFi credentials. The firmware builds and runs fine without this file --
+# it just stays offline. NEVER commit it.
+GatedPulsePico/secrets.h
+
+# Build artifacts
+build/
+*.elf
+*.uf2
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp

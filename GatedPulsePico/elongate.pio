@@ -1,0 +1,100 @@
+.program elongate
+; Self-contained COUNT-mode burst generator for T1/T2 elongation: unlike the
+; normal path (a free-running carrier SM gated by a separate counting SM),
+; this ONE state machine owns pulse generation AND the burst/mute cycle, so
+; "pulse 1 of this burst" is naturally wherever its own program counter loops
+; back to -- no IRQ or DMA-ring alignment trick needed to keep two SMs synced.
+;
+; SET pin group: base GP4, count 2 -> bit0 = marker (GP4), bit1 = output (GP5).
+; Matches the normal COUNT-mode gating program's bit layout.
+;
+; OUT pin group: base GP18, count 5 ->
+;   bits 0..2  GP18-20  amplitude / tap / channel select, meant for a
+;              74HC138-style one-hot decoder driving one opto+high-side leg per
+;              level, or one drive channel per bit in offset mode
+;   bit 3      GP21     UNUSED. PIO pin groups are consecutive, so reaching
+;              GP22 from base GP18 needs a 5-wide group and this bit falls on
+;              the mode button. GP21's function stays SIO, so the PIO block is
+;              not wired to that pad and writes here go nowhere.
+;   bit 4      GP22     cycle marker -- high for the whole of burst 1 of the
+;              repeating pattern, low for the rest of it, so a scope has a
+;              stable once-per-pattern trigger instead of GP4's every-burst one.
+; All of it rides in the SAME DMA stream as the timing, so "which pulse",
+; "which tap" and "which burst of the pattern" cannot drift apart -- no second
+; state machine, no IRQ alignment.
+;
+; The channel must drop between pulses (each channel carries the real pulse
+; train, not a burst-wide envelope) while the cycle marker must stay up across
+; the whole burst -- and both live in this one OUT group. A narrower write does
+; NOT achieve that:
+;
+;   `out pins, 3` on a 5-wide group does NOT leave GP21/GP22 untouched.
+;
+; The pin-write mask comes from the group's configured OUT_COUNT, not from the
+; instruction's bit count, so a short OUT zero-fills the rest of the group.
+; Measured on the bench (GP22 read 1.0% duty where a latched marker would read
+; 33%) after an earlier version of this program relied on the opposite.
+;
+; So the between-pulses value is carried in a register: each burst parks a "gap
+; mask" in ISR -- the cycle bit alone, or 0 -- and the low phase does
+; `mov osr, isr` + a full-width out, replacing `mov osr, null`. Same instruction
+; count, so the hi/lo derivations below are unchanged.
+;
+; The select for pulse i+1 is pulled during pulse i's LOW phase, not just
+; before its rising edge. That is deliberate: a phototransistor opto needs
+; microseconds to settle, so the address has to change at the START of the gap
+; and hold through all of T2. Pulse 1's select is pulled during the mute tail
+; for the same reason. The last pulse pushes 0, parking the decoder deselected
+; between bursts.
+;
+; Every burst, the CPU (via DMA, one linear transfer re-armed on completion by
+; the DMA's own IRQ -- see elongDmaIrqHandler() in the sketch) feeds the TX
+; FIFO in EXACTLY the order this program pulls it, or pulse 1 gets fed the
+; mute count instead of its own hi-phase and the whole burst is corrupted:
+;   N-1                          pulses this burst, 1..ELONG_MAX_PULSES
+;   gap                          held in ISR for every gap in this burst:
+;                                  the cycle bit alone, or 0
+;   amp                          pulse 1's select code
+;   hi_cycles-1, lo_cycles-1,    pulse 1's mark/space, in PIO clock cycles,
+;   amp                            then the select for pulse 2
+;   ... (N triples total) ...
+;   mute_cycles-1                 silence after the burst -- pulled LAST,
+;                                  once, after the on-phase loop exits
+; Loop overhead differs from gate_gen's "N+3/M+4" convention (this program's
+; hi/lo/mute phases each re-pull every iteration rather than reusing a value
+; latched once) -- see elongBuildInto() in the sketch for the exact
+; pushed = desired - {4, 9, 11} derivation for hi/lo/mute respectively. Every
+; count is measured "until the pins next move", so loop-exit and the following
+; setup instructions belong to the phase before them. hi is unchanged: nothing
+; sits between its `set pins,3` and the following `set pins,1`. lo grew to 9
+; with the mov+out pair that clears the channel. mute grew to 11 with the two
+; burst_start instructions that park the gap mask, which sit inside the window
+; the mute is measured over.
+
+burst_start:
+    pull block          ; OSR = N-1
+    mov x, osr
+    pull block          ; OSR = gap mask -- what the OUT group holds BETWEEN
+    mov isr, osr        ;   pulses: the cycle bit alone, or 0
+pulse:
+    pull block          ; OSR = channel mask (one-hot, or 0) | cycle marker
+    out pins, 5         ; channel HIGH -- before the pulse, so a decoder settles
+    pull block          ; OSR = hi_cycles-1
+    mov y, osr
+    set pins, 3         ; marker + output both high
+hi:
+    jmp y--, hi
+    pull block          ; OSR = lo_cycles-1
+    mov y, osr
+    set pins, 1         ; marker high, output low
+    mov osr, isr        ; the gap mask, not zero
+    out pins, 5         ; channel LOW, cycle marker held for the whole burst
+lo:
+    jmp y--, lo
+    jmp x--, pulse
+    pull block          ; OSR = mute_cycles-1
+    mov y, osr
+    set pins, 0         ; marker + output both low
+mute:
+    jmp y--, mute
+    jmp burst_start

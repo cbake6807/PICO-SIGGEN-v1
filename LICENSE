@@ -19,3 +19,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+This project drives high-voltage bench hardware. The warranty disclaimer above
+is not boilerplate: rectified and filtered high voltage stores lethal energy,
+and nothing in this repository is safety-rated. See the safety notes in
+README.md and AMPLITUDE_SEQUENCING.md before connecting anything to a load.

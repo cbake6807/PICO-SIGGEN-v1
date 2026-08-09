@@ -1,0 +1,14 @@
+.program gate_gen
+    pull block
+    mov  isr, osr
+    pull block
+cycle:
+    mov  x, osr
+    set  pins, 1
+hi:
+    jmp x--, hi
+    mov  y, isr
+    set  pins, 0
+lo:
+    jmp y--, lo
+    jmp  cycle
