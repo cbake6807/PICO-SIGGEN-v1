@@ -43,8 +43,37 @@ is the single easiest mistake to make here.
 | GP18–GP20 | 24 / 25 / 26 | channel outputs (offset & sync modes), or amplitude / tap select | out |
 | **GP21** | **27** | **output-mode button** — single / offset / sync | in |
 | **GP22** | **29** | **cycle marker** — burst 1 of the pattern | out |
+| **GP26** | **31** | **HV enclosure interlock** — closed to ground = safe | in |
 
-Free for your own use: GP0, GP1 (I²C), GP26–GP28 (the only ADCs).
+Free for your own use: GP0, GP1 (I²C), GP27 / GP28 (ADC).
+
+## The interlock on GP26
+
+Off by default. Turn it on from the **sys** tab or with `LOCK 1`, and only once
+something is actually wired, because an unwired input reads open and cuts the
+output — which is the entire point.
+
+Wire a normally-closed switch, a reed, or a Hall sensor between **GP26 (pin 31)
+and GND (pin 33)**. Closed to ground is the safe state, and that polarity is
+chosen so every failure lands on "unsafe": a cut wire, a dead sensor, or a
+connector never plugged in all float to the internal pull-up and read open. The
+opposite polarity would report a closed lid for a disconnected cable.
+
+Trips **latch**. Closing the lid does not restart the output; you have to press
+**ARM** (or send `ARM`), and the firmware refuses that until the input has been
+steadily closed for 250 ms, so an intermittent contact cannot be armed into. A
+reboot always comes up tripped — whatever the enclosure was doing when power
+went away is not knowable afterwards.
+
+Using an **A3144 / KY-003** Hall module for this: lift its onboard pull-up and
+LED and let the Pico's internal pull-up do the work, so the open-collector
+output swings 0–3.3 V. Do not feed the module's 5 V output to GP26 through a
+divider — a divider to ground reads *low* when the cable is unplugged, which
+inverts the fail-safe behaviour and is exactly the failure this input exists to
+catch. Add 1 nF at the pin if the run passes near the coils.
+
+**This is a reminder, not a guard.** A magnet defeats it in seconds. The bleeder
+resistor and a meter check across the capacitor stay mandatory.
 
 Ground is at board pins 3, 8, 13, 18, 23, 28 and 38 — every switch has one
 within a pin or two of itself. The two panel buttons are especially convenient:
@@ -62,9 +91,9 @@ GP2   4 │• carrier•│ 37  3V3_EN
 GP3   5 │• sig in •│ 36  3V3 OUT
 GP4   6 │• gate   •│ 35  ADC_VREF
 GP5   7 │• OUTPUT •│ 34  GP28
-GND   8 │•        •│ 33  AGND
+GND   8 │•        •│ 33  AGND        <-- interlock grounds here
 GP6   9 │• enc1 A •│ 32  GP27
-GP7  10 │• enc1 B •│ 31  GP26
+GP7  10 │• enc1 B •│ 31  GP26   INTERLOCK    <-- IN (low = safe)
 GP8  11 │• enc1 sw•│ 30  RUN
 GP9  12 │• out en •│ 29  GP22   cycle marker  <-- OUT
 GND  13 │•        •│ 28  GND         <-- both buttons ground here

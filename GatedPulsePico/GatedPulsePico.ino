@@ -85,6 +85,19 @@ static const uint PIN_DISABLE    = 9;   // press: output on/off
 static const uint PIN_MODE_SW    = 10;  // toggle: LOW = TIME, HIGH = COUNT
 static const uint PIN_STATUS_LED = 15;  // external LED + resistor
 
+// HV enclosure interlock. Board pin 31, with AGND right beside it at pin 33,
+// so the whole connection is a two-pin header.
+//
+// Polarity is chosen so every way this can break lands on "unsafe":
+//   closed (safe)  = pin pulled to GND by the sensor or switch
+//   open           = pin floats to the internal pull-up
+// A cut wire, an unpowered sensor, or nothing plugged in at all reads HIGH,
+// which is the open case. The alternative polarity would report "lid closed"
+// for a disconnected cable, which is exactly the failure a safety input exists
+// to catch. Same pull-up-and-switch-to-ground convention as every other input
+// here (RP2350 erratum E9 rules out the pull-downs).
+static const uint PIN_INTERLOCK  = 26;  // board pin 31, GND at pin 33
+
 // Second and third encoders: independent carrier controls. GP15 is skipped
 // (status LED) and GP23/24/25/29 are avoided even though this board doesn't
 // break them out at all -- on the plain Pico W they are wired straight to the
@@ -489,7 +502,16 @@ struct ElongCfg {
   double ratio  = 8.0;    // default if armed before ever being configured
 };
 static ElongCfg elong;
-static const uint32_t ELONG_MAX_PULSES = 25;
+// Was 25, and the binding constraint was never the PIO or the DMA -- it was
+// that this same constant sizes the persisted seqSteps[] array, which had to
+// fit the 512-byte settings budget. Raising the budget (still one flash
+// sector) lifts both together, so a 100-pulse burst and a 100-step SEQ table
+// stay the same number rather than becoming two limits to remember.
+//
+// Costs, both checked: the burst ring grows to RING_MAX * (3 + 3*N) words
+// (24 * 303 * 4 = 29 KB of RAM, against ~436 KB free), and Settings grows to
+// ~1.3 KB, guarded by the static_assert next to CFG_EE_SIZE.
+static const uint32_t ELONG_MAX_PULSES = 100;
 static const double   ELONG_RATIO_MIN  = 0.01;
 static const double   ELONG_RATIO_MAX  = 1000.0;
 static const double   ELONG_PHI        = 1.6180339887498949;
@@ -497,6 +519,37 @@ static const double   ELONG_PHI        = 1.6180339887498949;
 static bool outputEnabled = true;
 static bool gateInvert    = false;   // swap the open/closed phases
 static bool pulseInvert   = false;   // hardware pad inverter on the output
+
+// ---- HV interlock ---------------------------------------------------------
+// Two separate things, deliberately not merged:
+//   outputEnabled     what the operator asked for
+//   interlockTripped  what the enclosure says it is allowed to do
+// Folding the interlock into outputEnabled would let a trip get written to
+// flash as an intent, so re-arming would silently restore a state the operator
+// never chose -- and worse, the saved "output off" would look like a setting
+// rather than a fault.
+//
+// Latching on purpose. An interlock that clears itself the moment the lid
+// shuts brings HV back up with nobody's hand on a control; the operator has to
+// say ARM. That is the whole difference between an interlock and a switch.
+static bool     interlockEnabled  = false;   // persisted; off unless wired
+static bool     interlockTripped  = false;   // runtime only, never saved
+static uint32_t interlockOpenAt   = 0;       // first HIGH sample of a trip
+static uint32_t interlockShutAt   = 0;       // start of the current closed run
+static uint32_t interlockTrips    = 0;       // since boot, for the readout
+
+// Asymmetric on purpose: 2 ms to trip rejects a dV/dt spike coupled off the
+// coils without meaningfully delaying a real one (a lid cannot move in 2 ms),
+// while 250 ms of *continuous* closure before ARM is accepted stops a bouncing
+// or intermittent contact from being re-armed into.
+static const uint32_t INTERLOCK_TRIP_MS = 2;
+static const uint32_t INTERLOCK_SHUT_MS = 250;
+
+static inline bool interlockClosed() { return gpio_get(PIN_INTERLOCK) == 0; }
+
+// The one question the waveform path asks. Everything that used to test
+// outputEnabled directly must test this instead, or the interlock is advice.
+static inline bool outputLive() { return outputEnabled && !interlockTripped; }
 
 // Live encoder debug -- off by default, toggled with ENCLOG. Declared up
 // here (not down with the rest of the encoder code) because the ENCLOG
@@ -627,7 +680,9 @@ static void applyGate() {
   cfgTouch();                 // arm a deferred save; the write happens once quiet
   gateStop();
 
-  if (!outputEnabled) {
+  // gateParkPins() takes the channel pins and the cycle marker down with it,
+  // so a trip leaves nothing driven anywhere.
+  if (!outputLive()) {
     gateParkPins();
     return;
   }
@@ -779,7 +834,7 @@ static inline bool phaseOn() { return phaseMode != PH_OFF; }
 // so an explicit list of steps costs nothing but the parsing. `seqLen == 0`
 // means "no table loaded", and elongation falls back to the geometric ratio it
 // always used. Sharing ELONG_MAX_PULSES rather than inventing a second cap:
-// the PIO table is the same table, so the same 25 is the real limit.
+// the PIO table is the same table, so the same limit is the real one.
 struct SeqStep {
   uint32_t t1_ns;
   uint32_t t2_ns;
@@ -810,8 +865,11 @@ static uint32_t seqLen = 0;
 //      burn that in an afternoon, so a save happens at most once per editing
 //      session and only if the bytes actually differ.
 static const uint32_t CFG_MAGIC    = 0x47504C53UL;   // 'GPLS'
-static const uint16_t CFG_VERSION  = 3;   // 3: phaseMode alongside phaseLen
-static const uint32_t CFG_EE_SIZE  = 512;
+static const uint16_t CFG_VERSION  = 4;   // 4: ELONG_MAX_PULSES 25 -> 100
+// Still one 4 KB flash sector -- the core erases and rewrites the whole sector
+// either way, so this costs no extra wear and no extra write time, only a
+// larger staging buffer during begin()/end().
+static const uint32_t CFG_EE_SIZE  = 2048;
 static const uint32_t CFG_SETTLE_MS = 5000;          // quiet time before saving
 
 // Boot behaviour for the output enable, independent of the rest of the state.
@@ -827,7 +885,13 @@ struct __attribute__((packed)) Settings {
   uint8_t  gateMode, sigSource, shapeMode, selParam;
   uint8_t  gateInvert, pulseInvert, outputEnabled, bootMode;
   uint8_t  autosave, elongActive, trainLen, seqLen;
-  uint8_t  phaseLen, phaseMode, _pad[2];
+  // interlockEnabled claims one of the two spare pad bytes rather than growing
+  // the struct, so CFG_VERSION does not move and existing saved settings still
+  // load. Old blobs zeroed the padding, and zero here means "interlock off" --
+  // which is the right thing to inherit on a rig that has no sensor wired.
+  // The *tripped* state is deliberately not persisted: a fault is not a
+  // setting, and HV must never come back armed after a power cycle.
+  uint8_t  phaseLen, phaseMode, interlockEnabled, _pad[1];
 
   uint32_t onCount, offCount;
   uint64_t gatePeriodNs;
@@ -841,6 +905,14 @@ struct __attribute__((packed)) Settings {
 
   uint32_t crc;                                     // must stay LAST
 };
+
+// The check that was missing when ELONG_MAX_PULSES was 25. Nothing at runtime
+// notices Settings outgrowing the budget -- cfgWrite() memcpy's sizeof(s) into
+// a CFG_EE_SIZE buffer, so an overflow is a silent stomp past the end of it,
+// and the symptom would be corrupted settings rather than a build error.
+// Raise CFG_EE_SIZE (up to 4096, one sector) if this ever fires.
+static_assert(sizeof(Settings) <= CFG_EE_SIZE,
+              "Settings no longer fits CFG_EE_SIZE -- raise it (max 4096)");
 
 static bool     cfgAutosave = true;
 static uint8_t  cfgBootMode = BOOT_SAVED;
@@ -876,6 +948,7 @@ static void cfgCapture(Settings &s) {
   s.trainLen      = (uint8_t)trainLen;
   s.phaseLen      = (uint8_t)phaseLen;
   s.phaseMode     = phaseMode;
+  s.interlockEnabled = interlockEnabled ? 1 : 0;
   s.seqLen        = (uint8_t)seqLen;
 
   s.onCount        = onCount;
@@ -927,14 +1000,27 @@ static void cfgApply(const Settings &s) {
   trainLen = (s.trainLen <= TRAIN_MAX) ? s.trainLen : 0;
   phaseLen  = (s.phaseLen >= 1 && s.phaseLen <= AMP_BITS) ? s.phaseLen : 3;
   phaseMode = (s.phaseMode <= PH_SYNC) ? s.phaseMode : PH_OFF;
+
+  // Restored armed-but-tripped, never armed-and-live. Whatever the enclosure
+  // was doing when power went away is not knowable now, so the operator has to
+  // look at it and say ARM.
+  interlockEnabled = s.interlockEnabled ? true : false;
+  interlockTripped = interlockEnabled;
   for (uint32_t i = 0; i < TRAIN_MAX; i++)
     trainAmp[i] = (s.trainAmp[i] >= 1 && s.trainAmp[i] <= 100) ? s.trainAmp[i] : 100;
 
   seqLen = (s.seqLen <= ELONG_MAX_PULSES) ? s.seqLen : 0;
   for (uint32_t i = 0; i < ELONG_MAX_PULSES; i++) {
     seqSteps[i] = s.seqSteps[i];
-    if (!seqSteps[i].t1_ns || !seqSteps[i].t2_ns) { seqLen = 0; break; }
     seqSteps[i].amp &= AMP_MASK;
+  }
+  // Validate only the steps actually in use. The slots past seqLen are zero
+  // by construction (cfgCapture memsets the whole blob), so validating the
+  // full array treated that zero padding as corruption and threw the table
+  // away -- which meant any SEQ shorter than the maximum silently failed to
+  // survive a power cycle, reported afterwards as an innocent "SEQ off".
+  for (uint32_t i = 0; i < seqLen; i++) {
+    if (!seqSteps[i].t1_ns || !seqSteps[i].t2_ns) { seqLen = 0; break; }
   }
 
   switch (cfgBootMode) {
@@ -1430,6 +1516,7 @@ static void printState(Print &o) {
                                    : "TIME  (PIO gate generator)");
   o.print  ("output    : ");
   o.print  (outputEnabled ? "enabled" : "DISABLED");
+  if (interlockTripped) o.print(" (INTERLOCK OPEN - nothing driven)");
   o.print  ("   gate: ");
   o.print  (gateInvert ? "inverted" : "normal");
   o.print  ("   pulses: ");
@@ -1568,6 +1655,14 @@ static void printJson(Print &o) {
   o.print(",\"mode\":\"");  o.print(gateMode == MODE_COUNT ? "COUNT" : "TIME");
   o.print("\",\"src\":\""); o.print(sigSource == SRC_INT ? "INT" : "EXT");
   o.print("\",\"enabled\":");    o.print(outputEnabled ? 1 : 0);
+  // "enabled" stays the operator's intent; "live" is whether anything is
+  // actually coming out. Host tooling that arms a scope wants live.
+  o.print(",\"live\":");         o.print(outputLive() ? 1 : 0);
+  o.print(",\"interlock\":");    o.print(interlockEnabled ? 1 : 0);
+  o.print(",\"interlock_closed\":"); o.print(interlockClosed() ? 1 : 0);
+  o.print(",\"interlock_tripped\":"); o.print(interlockTripped ? 1 : 0);
+  o.print(",\"interlock_trips\":");   o.print(interlockTrips);
+  o.print(",\"interlock_pin\":");     o.print(PIN_INTERLOCK);
   o.print(",\"gate_invert\":");  o.print(gateInvert ? 1 : 0);
   o.print(",\"pulse_invert\":"); o.print(pulseInvert ? 1 : 0);
   o.print(",\"editing\":\"");
@@ -1807,6 +1902,8 @@ static void printHelp(Print &o) {
   o.println("  RUN <ms>       silent -> output for <ms> -> silent (one shot)");
   o.println("  SHOT           fire exactly ONE burst, then stop (COUNT mode)");
   o.println("  STOP           end a RUN / disable output now");
+  o.println("  LOCK <0|1>     HV enclosure interlock on GP26 (bare = report)");
+  o.println("  ARM            clear a tripped interlock (needs GP26 closed)");
   o.println("  R              restore defaults");
   o.println("  SAVE           store the current state in flash");
   o.println("  REBOOT         restart the board");
@@ -2307,14 +2404,43 @@ static void runCommand(char *s, Print &o) {
     outputEnabled = ((int)val != 0);
     applyGate();
     o.println(outputEnabled ? "output ENABLED" : "output DISABLED");
+    // Say so rather than letting "output ENABLED" sit there next to dead pins.
+    if (outputEnabled && interlockTripped)
+      o.println("  ...but the INTERLOCK is open, so nothing is coming out. ARM to clear.");
     return;
   }
+
+  // LOCK 0|1 -- enable the enclosure interlock. Enabling always lands tripped,
+  // whatever the pin says: arming is a deliberate act, and "I turned it on and
+  // it stayed running" teaches the operator the interlock does nothing.
+  if (!strcmp(s, "LOCK")) {
+    if (!hasArg) {
+      o.print("interlock "); o.print(interlockEnabled ? "ON" : "OFF");
+      o.print(", "); o.print(interlockTripped ? "TRIPPED" : "armed");
+      o.print(", GP26 reads "); o.println(interlockClosed() ? "closed" : "OPEN");
+      return;
+    }
+    interlockEnabled = ((int)val != 0);
+    interlockTripped = interlockEnabled;
+    interlockOpenAt = interlockShutAt = 0;
+    cfgTouch();
+    applyGate();
+    if (interlockEnabled) o.println("interlock ON -- tripped until you ARM");
+    else                  o.println("interlock OFF -- output no longer gated by GP26");
+    return;
+  }
+
+  if (!strcmp(s, "ARM")) { interlockArm(o); return; }
 
   // RUN <ms> — silent, then output for exactly <ms>, then silent again.
   // Returns immediately; loop() closes the window. The host arms its scope
   // before calling this and polls /state (running:0) or just waits ms.
   if (!strcmp(s, "RUN")) {
     if (!hasArg || val <= 0.0) { o.println("ERROR: need a duration in ms"); return; }
+    // Refuse rather than run a silent window. A host that arms a scope, calls
+    // RUN, and is told "started" would record an empty capture and blame the
+    // trigger -- the same reason burst length reports the clamped value.
+    if (interlockTripped) { o.println("ERROR: INTERLOCK open -- ARM first"); return; }
     if (val > 3600000.0) val = 3600000.0;              // 1 hour ceiling
     shotMode = false;
     outputEnabled = false; applyGate();                 // guarantee a silent start
@@ -2338,6 +2464,7 @@ static void runCommand(char *s, Print &o) {
     if (gateMode != MODE_COUNT) {
       o.println("ERROR: SHOT needs COUNT mode (M 1)"); return;
     }
+    if (interlockTripped) { o.println("ERROR: INTERLOCK open -- ARM first"); return; }
     runUntilMs = 0;
     shotMode = true;
     outputEnabled = false; applyGate();     // guarantee a silent, synced start
@@ -2374,6 +2501,10 @@ static void runCommand(char *s, Print &o) {
     // back a rig waiting on a signal generator that may not exist, and the
     // symptom is silence with every setting looking correct. Defaults must
     // land somewhere that actually pulses.
+    // interlockEnabled/interlockTripped are untouched here, and that is not an
+    // oversight: "restore defaults" must never be a way to disarm a safety
+    // input. Output comes back on as intent; if the enclosure is open it still
+    // will not emit, which is correct.
     sigSource = SRC_INT; outputEnabled = true;
     // ROTATE 3, not OFF. "Known state" exists to be pressed when nothing is
     // coming out -- and single mode idles GP18-20 and the GP22 marker, so
@@ -2689,6 +2820,54 @@ static void toggleElongation() {
   }
 }
 
+// Runs before anything else in loop(). Nothing here can be starved by a slow
+// HTTP request or a flash write, because the trip path is a pin read and an
+// applyGate() -- and applyGate() stops the state machines rather than asking
+// them nicely.
+static void pollInterlock() {
+  if (!interlockEnabled) { interlockOpenAt = interlockShutAt = 0; return; }
+
+  const uint32_t now = millis() ? millis() : 1;   // 0 is the "not timing" value
+
+  if (!interlockClosed()) {
+    interlockShutAt = 0;
+    if (interlockTripped) return;                 // already down; nothing to do
+    if (!interlockOpenAt) { interlockOpenAt = now; return; }
+    if ((uint32_t)(now - interlockOpenAt) < INTERLOCK_TRIP_MS) return;
+
+    interlockTripped = true;
+    interlockTrips++;
+    applyGate();                                  // output dies here, not later
+    inLogAction("INTERLOCK OPEN - output cut");
+    Serial.println("INTERLOCK OPEN -- output cut. Close the enclosure, then ARM.");
+    return;
+  }
+
+  interlockOpenAt = 0;
+  if (!interlockShutAt) interlockShutAt = now;    // start (or continue) timing
+}
+
+// Split out so the command, the button and the web endpoint cannot drift apart
+// on what counts as a legal re-arm.
+static bool interlockArm(Print &o) {
+  if (!interlockEnabled) { o.println("interlock is OFF (LOCK 1 to enable)"); return false; }
+  if (!interlockTripped) { o.println("interlock already armed");             return false; }
+  if (!interlockClosed()) {
+    o.println("REFUSED: enclosure still open (GP26 is high)");
+    return false;
+  }
+  if (!interlockShutAt || (uint32_t)(millis() - interlockShutAt) < INTERLOCK_SHUT_MS) {
+    o.print("REFUSED: needs "); o.print(INTERLOCK_SHUT_MS);
+    o.println(" ms of steady closure first -- check for an intermittent contact");
+    return false;
+  }
+  interlockTripped = false;
+  applyGate();
+  inLogAction("interlock ARMED");
+  o.println("interlock ARMED");
+  return true;
+}
+
 static void pollButtons() {
   static uint8_t  swLast = 1, disLast = 1, modeLast = 0xFF;
   static uint8_t  sw2Last = 1, sw3Last = 1;
@@ -2977,6 +3156,13 @@ void setup() {
   gpio_init(PIN_STATUS_LED);
   gpio_set_dir(PIN_STATUS_LED, GPIO_OUT);
 
+  // Not in INPUTS[] on purpose. That table drives the front-panel event log,
+  // which is deliberately undebounced and logs every edge -- an interlock
+  // chattering during a run would flood it and bury the actual trip message.
+  gpio_init(PIN_INTERLOCK);
+  gpio_set_dir(PIN_INTERLOCK, GPIO_IN);
+  gpio_pull_up(PIN_INTERLOCK);
+
   pioReady = pio_claim_free_sm_and_add_program(&gating_program,
                                                &pioGate, &smGate, &offGating)
           && pio_claim_free_sm_and_add_program(&gate_gen_program,
@@ -3043,6 +3229,8 @@ void loop() {
   // Nothing here is timing-critical: PIO owns the waveform and keeps running
   // whatever the CPU does. That is the whole payoff of the port — on the Nano
   // this loop *was* the waveform.
+  pollInterlock();           // safety first, literally: before any input that
+                             // could ask the output to come back on
   pollInputWatch();          // raw edges first, so a step is always
   pollEncoder();             // preceded in the log by the edges that
   pollEncoder2();            // produced it
@@ -3062,5 +3250,5 @@ void loop() {
     Serial.print("RUN complete ("); Serial.print(runLenMs); Serial.println(" ms)");
   }
 
-  gpio_put(PIN_STATUS_LED, outputEnabled && gpio_get(PIN_GATE_OUT));
+  gpio_put(PIN_STATUS_LED, outputLive() && gpio_get(PIN_GATE_OUT));
 }

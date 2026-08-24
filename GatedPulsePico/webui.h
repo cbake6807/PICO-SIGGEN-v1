@@ -45,6 +45,9 @@ header{position:sticky;top:0;z-index:9;background:#0d1117ee;
 #pw{flex:0 0 108px;border:0;border-radius:10px;font:600 15px/1.1 system-ui;
   color:#fff;background:#30363d;cursor:pointer;padding:10px 4px;letter-spacing:.4px}
 #pw.on{background:var(--go);box-shadow:0 0 0 1px #3fb95055,0 0 14px #2ea04355}
+/* A tripped interlock is not the same as "stopped" and must not look like it:
+   stopped is something you chose, tripped is the enclosure refusing. */
+#pw.trip{background:var(--red);box-shadow:0 0 0 1px #e5484d55,0 0 14px #e5484d55}
 #pw small{display:block;font-weight:400;font-size:10px;opacity:.85;margin-top:2px}
 .hstat{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;gap:5px}
 .chips{display:flex;flex-wrap:wrap;gap:4px}
@@ -100,6 +103,7 @@ button.go{background:var(--go);color:#fff;border-color:transparent}
 button.acc{background:var(--acc);color:#fff;border-color:transparent}
 button.warn{background:var(--warn);color:#fff;border-color:transparent}
 button.red{background:var(--red);color:#fff;border-color:transparent}
+button[disabled]{opacity:.35;cursor:not-allowed;filter:grayscale(1)}
 button.sel{background:var(--acc);color:#fff;border-color:transparent;font-weight:600}
 input,select{background:#0d1117;color:var(--fg);border:1px solid var(--line);
   border-radius:7px;padding:9px;font-size:14px;min-height:36px}
@@ -294,7 +298,7 @@ body.count .timeonly,body.time .countonly{display:none}
  <div class=card><h2>train &mdash; per-burst amplitude ring</h2>
   <div class=row>
    <label>bursts in ring</label>
-   <select id=trn onchange="mark('train');buildTrain(+this.value)">
+   <select id=trn onchange="mark('train');buildTrain(+this.value);armTrain()">
     <option>2</option><option>3</option><option>4</option><option>5</option>
     <option selected>6</option><option>7</option><option>8</option></select>
    <button class=go onclick="armTrain()">arm ring</button>
@@ -323,6 +327,31 @@ body.count .timeonly,body.time .countonly{display:none}
    ground. Board pin numbers are the ones you count on the header.</p>
   <div id=pins class=pins></div>
  </div>
+</section>
+
+<section data-tab=sensors>
+ <div class=card><h2>sensor node</h2>
+  <div class=row>
+   <label>host</label>
+   <input id=snhost type=text placeholder="gatedsensor.local" style="width:180px"
+          onchange="saveSn()">
+   <button onclick="pollSensors(1)">read now</button>
+   <button onclick="snCmd('SCAN')">rescan I2C</button>
+   <span class=kv id=snstat></span>
+  </div>
+  <p class=note>A second board, polled by your browser directly &mdash; not
+   relayed through this one, so a sensor fault cannot disturb the waveform.
+   Wire its <b>GP2 (pin 4)</b> to this board's <b>GP22 (pin 29)</b> plus a
+   ground, and it locks to the cycle marker.</p>
+ </div>
+ <div class=card><h2>cycle-marker lock</h2><div class=chips id=snsync></div></div>
+ <div class=card><h2>analog</h2>
+  <div class=chips id=snadc></div>
+  <p class=note>Raw millivolts from the on-chip ADC. <b>Not calibrated current</b>
+   &mdash; the real path is an external 16-bit converter behind an analog
+   peak-hold.</p>
+ </div>
+ <div class=card><h2>I&sup2;C bus</h2><pre id=sni2c>&mdash;</pre></div>
 </section>
 
 <section data-tab=sys>
@@ -358,6 +387,21 @@ body.count .timeonly,body.time .countonly{display:none}
      <button onclick="c('DIAG')">diag</button>
      <button onclick="c('?')">help</button>
     </div>
+   </div>
+   <div class=card><h2>HV enclosure interlock</h2>
+    <div class=chips id=lockchips></div>
+    <div class=row>
+     <button id=lockbtn onclick="tglLock()">&mdash;</button>
+     <button id=armbtn class=go onclick="c('ARM')">ARM</button>
+    </div>
+    <p class=note>Wire a normally-closed switch or a Hall sensor between
+     <b>GP26 (pin 31)</b> and <b>GND (pin 33)</b>: closed to ground = safe.
+     A cut wire or an unplugged sensor reads open and cuts the output, which is
+     the point &mdash; so leave this off until it is wired.
+     Trips latch; you must ARM to clear.</p>
+    <p class=note><b>This is a reminder, not a guard.</b> A magnet defeats it in
+     seconds. The bleeder resistor and a meter check across the capacitor stay
+     mandatory before anything goes inside.</p>
    </div>
    <div class=card><h2>danger</h2>
     <div class=row>
@@ -507,19 +551,34 @@ function setExact(k){
   sendFade(k);
 }
 
-/* ---- train ring ---- */
+/* ---- train ring ----
+   These sliders send on release, like every other control here. They used to
+   need a separate "arm ring" click, which made them the one place where the
+   screen could hold values the firmware had never been told about -- and the
+   dirty window is a 4 s timeout, not a commit, so once it lapsed the poller
+   found sliders disagreeing with /state and dutifully overwrote them. The edit
+   vanished several seconds after it was made, which reads as the board
+   fighting you rather than as a value that was never sent.
+   Sending on change removes the disagreement instead of papering over it. */
 function buildTrain(n,vals){
   const keep=[...document.querySelectorAll('.trs')].map(e=>+e.value);
   $('bank_train').innerHTML=Array.from({length:n},(_,i)=>{
     const x=(vals&&vals[i])||keep[i]||100;
     return '<div class=fd><b>'+x+' %</b>'
       +'<input type=range class="v trs" min=1 max=100 value='+x
-      +' oninput="mark(\'train\');this.previousElementSibling.textContent=this.value+\' %\'">'
+      +' oninput="mark(\'train\');this.previousElementSibling.textContent=this.value+\' %\'"'
+      +' onchange="armTrain()">'
       +'<span class=fl>burst '+(i+1)+'</span></div>';
   }).join('');
 }
-const setTrain=a=>{mark('train');$('trn').value=a.length;buildTrain(a.length,a)};
-const armTrain=()=>c('TRAIN '+[...document.querySelectorAll('.trs')].map(e=>e.value).join(' '));
+const trainVals=()=>[...document.querySelectorAll('.trs')].map(e=>+e.value);
+// setTrain is the USER path (presets, ring resize): render, then push.
+// The poller calls buildTrain() directly so its own refresh neither re-marks
+// the group nor echoes a command back at the board.
+const setTrain=a=>{$('trn').value=a.length;buildTrain(a.length,a);armTrain()};
+// mark() here and not only on the slider: the hold has to be refreshed by the
+// SEND, or a slow drag can lapse the window before the command even goes out.
+const armTrain=()=>{mark('train');c('TRAIN '+trainVals().join(' '))};
 
 /* ---- transport ---- */
 let toastT=null;
@@ -541,10 +600,25 @@ async function c(cmd){
 }
 const ask=(q,cmd)=>{ if(confirm(q)) c(cmd); };
 const tglE=()=>c(st&&st.enabled?'E 0':'E 1');
+const tglLock=()=>c(st&&st.interlock?'LOCK 0':'LOCK 1');
+function paintLock(){
+  const on=!!st.interlock, shut=!!st.interlock_closed, trip=!!st.interlock_tripped;
+  $('lockchips').innerHTML=
+     chip(on?'interlock ON':'interlock OFF',on?'md':'k')
+    +chip('GP'+st.interlock_pin+(shut?' closed':' OPEN'),shut?'k':'wr')
+    +(on?chip(trip?'TRIPPED':'armed',trip?'wr':'md'):'')
+    +(st.interlock_trips?chip(st.interlock_trips+' trip'+(st.interlock_trips>1?'s':'')
+                              +' since boot','k'):'');
+  $('lockbtn').textContent=on?'disable interlock':'enable interlock';
+  $('lockbtn').className=on?'warn':'';
+  // Disabled rather than hidden: a greyed ARM you cannot press explains why
+  // better than an ARM that vanishes.
+  $('armbtn').disabled=!(on&&trip&&shut);
+}
 
 /* ---- tabs ---- */
 const TABS=[['carrier','carrier'],['burst','burst'],['channels','channels'],
-            ['shape','shape'],['train','train'],['inputs','panel'],['sys','system']];
+            ['shape','shape'],['train','train'],['inputs','panel'],['sensors','sensors'],['sys','system']];
 function showTab(id){
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.dataset.tab==id));
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t==id));
@@ -602,6 +676,53 @@ async function pollInputs(){
 }
 setInterval(pollInputs,250);
 
+/* ---- sensor node --------------------------------------------------------
+   Fetched by the BROWSER from the other board, not proxied through this one.
+   Proxying would couple the two, so a sensor problem could stall the generator
+   -- exactly what running them on separate hardware was meant to avoid. */
+function snHost(){
+  let h=$('snhost').value.trim();
+  if(!h){ try{h=localStorage.getItem('snhost')||''}catch(e){} }
+  return h||'gatedsensor.local';
+}
+function saveSn(){ try{localStorage.setItem('snhost',$('snhost').value.trim())}catch(e){} }
+async function snCmd(c){
+  try{ await fetch(`http://${snHost()}/cmd?c=${encodeURIComponent(c)}`); toast('sensor: '+c) }
+  catch(e){ toast('sensor unreachable',1) }
+  pollSensors(1);
+}
+async function pollSensors(force){
+  const vis=document.querySelector('section[data-tab=sensors]').classList.contains('on');
+  if(!vis&&!force) return;
+  let d;
+  try{
+    const r=await fetch(`http://${snHost()}/state`,{cache:'no-store'});
+    d=await r.json();
+  }catch(e){
+    $('snstat').innerHTML='<b>unreachable</b>';
+    $('snsync').innerHTML=chip('no answer from '+snHost(),'wr');
+    $('snadc').innerHTML=''; $('sni2c').textContent='—';
+    return;
+  }
+  $('snstat').innerHTML=`up <b>${d.uptime_s}s</b> &middot; ${d.wifi}`;
+  $('snsync').innerHTML = d.sync_live
+    ? chip('LOCKED','on')
+      +chip('pattern '+(d.pattern_period_us/1000).toFixed(3)+' ms','k')
+      +chip(d.pattern_hz.toFixed(2)+' Hz','k')
+      +chip('marker '+(d.marker_high_us/1000).toFixed(3)+' ms','k')
+      +chip('duty '+d.marker_duty_pct.toFixed(1)+'%','k')
+      +chip('ring '+d.implied_ring_len,'md')
+      +chip(d.sync_edges+' edges','k')
+    : chip('NO SYNC — wire GP22 (pin 29) to its GP2 (pin 4) + ground','wr');
+  $('snadc').innerHTML=(d.adc_mv||[]).map((v,i)=>
+      chip('GP'+(26+i)+' '+v.toFixed(1)+' mV','k')).join('')
+    +chip('chip '+d.chip_c.toFixed(1)+' °C','k');
+  $('sni2c').textContent = d.i2c_count
+    ? d.i2c.map(x=>`${x.addr}  ${x.guess}`).join('\n')
+    : 'nothing on the bus — wire something and press rescan';
+}
+setInterval(pollSensors,2000);
+
 /* ---- poll ---- */
 const chip=(txt,cls)=>'<span class="chip '+(cls||'')+'">'+txt+'</span>';
 const seg=(id,on)=>$(id)&&$(id).classList.toggle('sel',!!on);
@@ -611,8 +732,12 @@ async function poll(){
   const f=st.carrier_ns?1e9/st.carrier_ns:0;
   const t1=st.carrier_ns/1000*st.carrier_duty_ppm/1e6;
 
-  $('pw').className=st.enabled?'on':'';
-  $('pws').textContent=st.enabled?'running':'stopped';
+  // "live", not "enabled": with the interlock open the operator's intent is
+  // still ON while nothing is coming out, and a green button there would be a
+  // lie told next to a high-voltage cell.
+  $('pw').className=st.live?'on':(st.interlock_tripped?'trip':'');
+  $('pws').textContent=st.live?'running':(st.interlock_tripped?'INTERLOCK':'stopped');
+  paintLock();
 
   $('hkv').innerHTML=chip(fHz(f),'k')+chip(fPc(st.carrier_duty_ppm/1e4),'k')
     +chip('T1 '+fUs(t1),'k')
@@ -662,8 +787,9 @@ async function poll(){
     $('r1w').value=st.ramp1_wrap?'WRAP':'STOP';
   }
   if(clean('train')&&st.train_len){
-    const cur=[...document.querySelectorAll('.trs')].map(e=>+e.value);
-    if(cur.length!=st.train_len||cur.some((x,i)=>x!=st.train[i])) setTrain(st.train);
+    const cur=trainVals();
+    if(cur.length!=st.train_len||cur.some((x,i)=>x!=st.train[i]))
+      buildTrain(st.train_len,st.train);      // render only -- never re-send
   }
 }
 

@@ -263,6 +263,8 @@ E 1 / E 0      output on / off
 ON <n>         pulses passed per burst  OFF <n>   pulses muted per burst
 SHOT           fire exactly ONE burst   RUN <ms>  output for ms, silent either side
 STOP           end a RUN / disable now
+LOCK 0|1       HV enclosure interlock on GP26 (bare LOCK reports state)
+ARM            clear a tripped interlock (refused unless GP26 is closed)
 
 SRC INT|EXT    internal carrier, or the GP3 input
 C <Hz>         carrier frequency        CD <pct>  carrier duty
@@ -303,7 +305,7 @@ last by a fixed factor, so `ELONGATE 8` spans 8× from first to last. Pulse 1
 stays at the current T1/T2.
 
 **SEQ** replaces that ratio with an explicit table when you want a shape a ratio
-cannot describe. Up to 25 steps.
+cannot describe. Up to 100 steps.
 
 **TRAIN** is a ring of amplitudes applied *across* bursts — burst 1 at 100 %,
 burst 2 at 75 %, and so on, repeating. It composes with the two above: TRAIN

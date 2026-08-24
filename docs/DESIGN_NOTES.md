@@ -112,19 +112,28 @@ quantised by how many bursts fall inside it. At 100 kHz / ON 10 / OFF 90 a 50 ms
 window read a true 33 % as either 20 % or 40 %; 200 ms keeps that error small
 enough not to mislead.
 
-## The 25-pulse cap
+## The 100-pulse cap
 
-`ELONG_MAX_PULSES` is 25. In any mode that runs the elongation engine — that is,
+`ELONG_MAX_PULSES` is 100. In any mode that runs the elongation engine — that is,
 elongation, `SEQ`, `TRAIN` or channel output — a burst longer than that is
 clamped. The normal carrier+gate path has no such limit.
 
 The state readout reports the **effective** burst length and flags the clamp
 (`burst_clamped`, `burst_requested`), because an instrument that quietly emits
-25 pulses while reporting 40 is worse than one with a documented limit.
+100 pulses while reporting 150 is worse than one with a documented limit.
 
-Raising it is not free: the same constant sizes the persisted `seqSteps[]` array
-inside a 512-byte flash sector, so lifting the DMA-table limit means decoupling
-it from the saved-sequence limit first.
+It was 25 for a long time, and the binding constraint was never the PIO or the
+DMA — it was that the same constant sizes the persisted `seqSteps[]` array,
+which had to fit a 512-byte settings budget. That budget was raised to 2 KB,
+which is still inside the one 4 KB flash sector the core erases and rewrites
+whole, so it costs no extra wear and no extra write time. Both limits moved
+together, which is why a 100-pulse burst and a 100-step `SEQ` are the same
+number rather than two you have to remember separately.
+
+`static_assert(sizeof(Settings) <= CFG_EE_SIZE)` guards it now. Nothing at
+runtime notices the struct outgrowing the buffer — `cfgWrite()` memcpy's
+`sizeof(s)` into it — so the failure mode was a silent overwrite past the end,
+surfacing later as corrupted settings rather than as a build error.
 
 ## Scaling past three channels
 
