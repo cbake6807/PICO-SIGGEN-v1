@@ -59,37 +59,109 @@ every input uses the RP2350's internal pull-up, so there is nothing else to add.
 
 ## 2. Flash it
 
-### Install the toolchain, once
+New to the command line? Follow these in order — every step matters. The
+commands are the same on Windows, macOS and Linux unless a step says otherwise.
 
-Install [arduino-cli](https://arduino.github.io/arduino-cli/latest/installation/),
-then add the RP2040/RP2350 core:
+### Step 1 — Download the code
 
-```bash
+1. On this repo's GitHub page, click the green **Code** button, then
+   **Download ZIP**.
+2. Unzip it. On Windows: right-click the ZIP → **Extract All…**
+3. Move the extracted folder somewhere easy to find, such as **Documents**.
+   Avoid `C:\Program Files` — Windows blocks writing there without admin
+   rights, which gets in the way later.
+
+You now have a folder called `PICO-SIGGEN-v1-main`, and inside it a folder
+called `GatedPulsePico`. That inner folder is the firmware.
+
+(If you use git: `git clone https://github.com/cbake6807/PICO-SIGGEN-v1` does
+the same thing.)
+
+### Step 2 — Install arduino-cli
+
+Download and run the installer for your OS from the
+[arduino-cli install page](https://arduino.github.io/arduino-cli/latest/installation/)
+(on Windows, the `.msi` installer is the easy one).
+
+### Step 3 — Open a terminal
+
+- **Windows:** press Start, type `cmd`, open **Command Prompt**.
+- **macOS:** open **Terminal** (Applications → Utilities).
+- **Linux:** open your terminal.
+
+Check it worked by typing this and pressing Enter:
+
+```
+arduino-cli version
+```
+
+It should print a version number. If it says the command is not recognised,
+close the terminal, open a new one, and try again.
+
+**How to run the commands below:** copy **one line** at a time, paste it
+(right-click in Command Prompt), and press Enter. Wait for it to finish before
+the next line. Some commands print nothing when they succeed — that is normal.
+
+### Step 4 — Install the Pico board support (once)
+
+```
 arduino-cli config init
 arduino-cli config set board_manager.additional_urls https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
 arduino-cli core update-index
 arduino-cli core install rp2040:rp2040
 ```
 
-Each command is a single line, so these work as-is in Windows Command Prompt
-and PowerShell as well as macOS/Linux shells.
+- `config init` may say a config file already exists — that is fine.
+- The last command downloads a lot and can take several minutes.
+- `Platform rp2040:rp2040@... already installed` means it is done.
 
 That core is the community RP2040/RP2350 one by earlephilhower — the official
 Arduino Mbed core will **not** build this.
 
-### Build and upload
+### Step 5 — Go to the code folder
 
-**First flash only:** hold the **BOOTSEL** button while plugging in the USB
-cable. The board appears as a USB drive, which is how the uploader reaches a
-board with no firmware on it. After that, uploads reset it automatically and
-you never touch BOOTSEL again.
+The build and upload commands only work from **inside the folder you unzipped
+in Step 1**. Type `cd`, a space, then the folder's location. The easy way on
+Windows: type `cd ` (with the space), drag the `PICO-SIGGEN-v1-main` folder from
+File Explorer into the Command Prompt window, and press Enter. For example:
 
-```bash
-arduino-cli compile --fqbn rp2040:rp2040:rpipico2w GatedPulsePico
-arduino-cli upload  --fqbn rp2040:rp2040:rpipico2w --port PORT GatedPulsePico
+```
+cd "%USERPROFILE%\Documents\PICO-SIGGEN-v1-main"
 ```
 
-Find `PORT` with `arduino-cli board list`:
+Check you are in the right place — this should list `GatedPulsePico`
+(on macOS/Linux use `ls` instead of `dir`):
+
+```
+dir
+```
+
+If you do not see `GatedPulsePico`, you are in the wrong folder — go back to
+Step 1.
+
+### Step 6 — Plug in the board
+
+**First flash only:** hold the **BOOTSEL** button on the Pico while plugging in
+the USB cable, then let go. The board appears as a USB drive called `RP2350`.
+That is how the uploader reaches a board with no firmware on it. After the
+first flash, uploads reset it automatically and you never touch BOOTSEL again.
+
+### Step 7 — Build and upload
+
+Build the firmware (takes a minute the first time):
+
+```
+arduino-cli compile --fqbn rp2040:rp2040:rpipico2w GatedPulsePico
+```
+
+Find the board's port:
+
+```
+arduino-cli board list
+```
+
+Look in the **Port** column. A board in BOOTSEL mode shows as a UF2 board
+(e.g. `UF2_Board`); once it has firmware it shows as a serial port:
 
 | OS | looks like |
 |---|---|
@@ -97,9 +169,26 @@ Find `PORT` with `arduino-cli board list`:
 | macOS | `/dev/cu.usbmodem14201` |
 | Linux | `/dev/ttyACM0` |
 
-On macOS and Linux, `make flash` does both and finds the port itself.
+Upload, replacing `COM4` with whatever the Port column showed:
+
+```
+arduino-cli upload --fqbn rp2040:rp2040:rpipico2w --port COM4 GatedPulsePico
+```
+
+To update later: download the new ZIP (Step 1), then repeat Steps 5–7.
+
+On macOS and Linux, `make flash` does the build, port lookup and upload in one go.
 
 ### If it goes wrong
+
+**"Can't open sketch" / "no such file" for `GatedPulsePico`.** You are not in
+the code folder. Redo Step 5 and check `dir` lists `GatedPulsePico`.
+
+**Errors mentioning `\https://`, `%5C`, or "first path segment in URL cannot
+contain colon".** An older copy of these instructions split a command over two
+lines, which saved a broken URL. Run the `config set` line from Step 4 again —
+it replaces the broken entry — then `arduino-cli core update-index` should run
+clean.
 
 **"No such file or directory" / port missing.** The board only shows a serial
 port once it is running firmware. On a blank board, use BOOTSEL.
@@ -204,9 +293,12 @@ only way to know which mode a press landed on is to plug in USB.
 
 Copy the example and fill it in:
 
-```bash
-cp GatedPulsePico/secrets.h.example GatedPulsePico/secrets.h
 ```
+copy GatedPulsePico\secrets.h.example GatedPulsePico\secrets.h
+```
+
+(on macOS/Linux: `cp GatedPulsePico/secrets.h.example GatedPulsePico/secrets.h`),
+then open `GatedPulsePico/secrets.h` in any text editor:
 
 ```c
 #define WIFI_SSID "your-ssid"
