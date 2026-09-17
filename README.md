@@ -66,11 +66,13 @@ then add the RP2040/RP2350 core:
 
 ```bash
 arduino-cli config init
-arduino-cli config add board_manager.additional_urls \
-  https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
+arduino-cli config set board_manager.additional_urls https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
 arduino-cli core update-index
 arduino-cli core install rp2040:rp2040
 ```
+
+Each command is a single line, so these work as-is in Windows Command Prompt
+and PowerShell as well as macOS/Linux shells.
 
 That core is the community RP2040/RP2350 one by earlephilhower — the official
 Arduino Mbed core will **not** build this.
