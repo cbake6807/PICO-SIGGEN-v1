@@ -4,7 +4,12 @@
     pull block
 cycle:
     mov  x, osr
-    set  pins, 1
+    ; 31, not 1: SET writes as many bits as the SM's SET_COUNT and zero-fills
+    ; the rest, exactly like OUT. With a 1-pin group (every gate_gen user until
+    ; the frequency sweep) only bit 0 lands, so this is identical to `set
+    ; pins, 1`. With a wider group it drives the whole group high together,
+    ; which is what lets one state machine carry all three channel pins.
+    set  pins, 31
 hi:
     jmp x--, hi
     mov  y, isr

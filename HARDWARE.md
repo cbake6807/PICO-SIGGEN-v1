@@ -47,6 +47,35 @@ is the single easiest mistake to make here.
 
 Free for your own use: GP0, GP1 (I²C), GP27 / GP28 (ADC).
 
+## Selecting channels, and what the pins do in sweep mode
+
+`PHASE CH 2 3` picks which of GP18/19/20 take part; a bare `PHASE 2` still means
+"the first two". **Offset** rotates across only the selected channels, **sync**
+fires only those together, and a deselected channel is held low at the pad in
+every mode — worth knowing if you ever lose a driver and want to keep running on
+the survivors. At least one channel always stays selected.
+
+`FSWEEP` is a different animal from the gated modes. It sweeps a continuous
+50 % square from ~0 up to a ceiling (default 10 kHz) and back, with no gating at
+all, and it changes what two pins mean:
+
+| Pin | In gated modes | In `FSWEEP` |
+|---|---|---|
+| **GP4** | burst marker | **sweep marker** — high on the way up, low on the way down |
+| **GP5** | the pulse train | the continuous swept tone |
+| **GP18–20** | channels, rotated or synced | all selected channels together, same tone |
+| **GP2** | internal carrier monitor | mirrors the swept tone |
+
+GP4 stays your scope trigger either way; in sweep mode its level also tells you
+which direction you are watching. **Encoder 2** — normally carrier frequency —
+becomes the sweep speed while a sweep is running, since there is no fixed
+frequency to set.
+
+Three channels conducting at once is three times the draw on the shared rail.
+If they are taps of one winding rather than separate cells, simultaneous
+conduction shorts the turns between them; the one-hot decoder that normally
+makes that unreachable is bypassed in this mode.
+
 ## The interlock on GP26
 
 Off by default. Turn it on from the **sys** tab or with `LOCK 1`, and only once

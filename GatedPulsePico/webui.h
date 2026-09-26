@@ -163,6 +163,40 @@ body.count .timeonly,body.time .countonly{display:none}
 <main>
 
 <section data-tab=carrier>
+ <div class=card id=fswcard><h2>frequency sweep &mdash; continuous, ungated</h2>
+  <div class=row>
+   <button id=fswbtn class=go onclick="tglFsw()">start sweep</button>
+   <span class=chips id=fswchips></span>
+  </div>
+  <div class=row>
+   <label>cycle time</label>
+   <input type=range id=fswms class=wide min=50 max=20000 step=50 value=2000
+     oninput="mark('fsw');$('fswms_v').textContent=fmtMs(+this.value)"
+     onchange="c('FSWEEP '+this.value)">
+  </div>
+  <div class=row>
+   <span class=kv>full up-and-back: <b id=fswms_v>&mdash;</b></span>
+   <label style=min-width:auto>top</label>
+   <input type=number id=fswhi value=10000 step=100 style=width:100px
+     onchange="mark('fsw');c('FSWEEP HI '+this.value)"><span class=kv>Hz</span>
+  </div>
+  <p class=note>Sweeps <b>0 &rarr; top &rarr; 0</b> and repeats, at a fixed
+   <b>50 % duty</b>, with <b>no gating at all</b> &mdash; one continuous tone on
+   GP5, mirrored on GP2, and on <b>all three channels GP18&ndash;GP20 together</b>
+   (one state machine drives all three, so there is no skew between them).
+   <b>Encoder 2</b> (the frequency knob) sets the cycle time while this is
+   running.</p>
+  <p class=note>Three legs conducting at once is <b>three times the draw</b> on
+   the shared rail. If these are taps of one winding rather than separate cells,
+   simultaneous conduction shorts the turns between them &mdash; the one-hot
+   decoder that normally prevents that is bypassed in this mode.</p>
+  <p class=note>GP4 marks the sweep instead of a burst: <b>high on the way up,
+   low on the way down</b>, so it is still your scope trigger and it tells you
+   which direction you are watching. ON/OFF, PHASE, ELONGATE and SEQ do nothing
+   while the sweep owns the output.</p>
+  <p class=note>The bottom of the band is not DC &mdash; the PIO clock divider
+   runs out at <b id=fswlo>&mdash;</b>, which is what "0" really means here.</p>
+ </div>
  <div class=grid>
   <div class=card><h2>carrier</h2>
    <div class=bank id=bank_carrier></div>
@@ -228,14 +262,20 @@ body.count .timeonly,body.time .countonly{display:none}
   <div class=card><h2>output mode</h2>
    <div class="row seg">
     <button id=ph_off onclick="c('PHASE OFF')">single</button>
-    <button id=ph_rot onclick="c('PHASE ROT '+v('phn'))">offset</button>
-    <button id=ph_sync onclick="c('PHASE SYNC '+v('phn'))">sync</button>
+    <button id=ph_rot onclick="c('PHASE ROT')">offset</button>
+    <button id=ph_sync onclick="c('PHASE SYNC')">sync</button>
    </div>
    <div class=row><label>channels</label>
-    <select id=phn onchange="mark('ph')">
-     <option>1</option><option>2</option><option selected>3</option></select>
+    <button id=ch1 onclick="tglCh(1)">ch1 GP18</button>
+    <button id=ch2 onclick="tglCh(2)">ch2 GP19</button>
+    <button id=ch3 onclick="tglCh(3)">ch3 GP20</button>
     <button onclick="c('PHASE DUMP')">dump tables</button>
    </div>
+   <p class=note>Pick which channels take part. <b>Offset</b> rotates across
+    only the selected ones, <b>sync</b> fires only those together, and a
+    deselected channel is <b>held low at the pad</b> in every mode &mdash; not
+    merely left out of the table &mdash; so a dead driver cannot be switched on
+    by a stale code or a half-applied change. At least one stays selected.</p>
    <p class=note id=phnote></p>
   </div>
   <div class=card><h2>pins</h2>
@@ -551,6 +591,38 @@ function setExact(k){
   sendFade(k);
 }
 
+/* ---- channel select ----
+   The mask is the single source of truth; the buttons just toggle a bit and
+   send the whole resulting list, so the board is never told a delta it has to
+   reconcile against what the page happened to be showing. */
+function tglCh(n){
+  const cur=(st&&st.phase_mask!==undefined)?st.phase_mask:7;
+  const m=cur^(1<<(n-1));
+  if(!m){ toast('at least one channel must stay on',1); return; }
+  const list=[1,2,3].filter(i=>m&(1<<(i-1))).join(' ');
+  c('PHASE CH '+list);
+}
+
+/* ---- continuous frequency sweep ---- */
+const fmtMs=v=>v>=1000?(v/1000).toFixed(v>=10000?0:2)+' s':v+' ms';
+const tglFsw=()=>c(st&&st.fsweep?'FSWEEP OFF':'FSWEEP '+v('fswms'));
+function paintFsw(){
+  const on=!!st.fsweep;
+  $('fswbtn').textContent=on?'stop sweep':'start sweep';
+  $('fswbtn').className=on?'red':'go';
+  // The live frequency is the only way to tell a running sweep from a stalled
+  // one, so it is a chip rather than buried in a readout.
+  $('fswchips').innerHTML=on
+    ? chip(fHz(st.fsweep_hz),'on')+chip(st.fsweep_dir=='up'?'\u2191 rising':'\u2193 falling','md')
+    : chip('idle','k');
+  $('fswlo').textContent=fHz(st.fsweep_hi_hz/65536);
+  if(clean('fsw')){
+    $('fswms').value=st.fsweep_ms;
+    $('fswhi').value=st.fsweep_hi_hz;
+  }
+  $('fswms_v').textContent=fmtMs(st.fsweep_ms);
+}
+
 /* ---- train ring ----
    These sliders send on release, like every other control here. They used to
    need a separate "arm ring" click, which made them the one place where the
@@ -738,6 +810,7 @@ async function poll(){
   $('pw').className=st.live?'on':(st.interlock_tripped?'trip':'');
   $('pws').textContent=st.live?'running':(st.interlock_tripped?'INTERLOCK':'stopped');
   paintLock();
+  paintFsw();
 
   $('hkv').innerHTML=chip(fHz(f),'k')+chip(fPc(st.carrier_duty_ppm/1e4),'k')
     +chip('T1 '+fUs(t1),'k')
@@ -748,6 +821,9 @@ async function poll(){
           :(st.phase_mode=='ROTATE'?'offset':'sync')+' x'+st.phase_len;
   $('hmode').innerHTML=chip(st.mode+' / '+st.src,'md')+chip(om,'md')
     +(st.ring_len>1?chip('ring '+st.ring_len+' - GP'+st.cycle_pin+' marks #1','md'):'')
+    +(st.phase_mask!==undefined&&st.phase_mask!=7
+        ?chip('ch '+[1,2,3].filter(i=>st.phase_mask&(1<<(i-1))).join('+')+' only','wr'):'')
+    +(st.fsweep?chip('SWEEP '+fHz(st.fsweep_hz)+' '+(st.fsweep_dir=='up'?'\u2191':'\u2193'),'on'):'')
     +(st.elongation?chip('elong '+st.elong_ratio+'x','wr'):'')
     +(st.sweep?chip('sweep','wr'):'')
     +(st.seq_len?chip('seq '+st.seq_len,'wr'):'')
@@ -760,6 +836,12 @@ async function poll(){
   seg('shp_fd',st.shape=='FD');    seg('shp_t12',st.shape!='FD');
   seg('ph_off',st.phase_mode=='OFF'); seg('ph_rot',st.phase_mode=='ROTATE');
   seg('ph_sync',st.phase_mode=='SYNC');
+  for(let i=1;i<=3;i++){
+    const on=!!(st.phase_mask&(1<<(i-1)));
+    const b=$('ch'+i);
+    b.className=on?'sel':'warn';       // amber, not plain: a channel switched
+    b.textContent=(on?'ch':'ch')+i+' GP'+(17+i)+(on?'':' OFF');
+  }
   seg('bm_saved',st.boot_mode=='SAVED'); seg('bm_run',st.boot_mode=='RUN');
   seg('bm_off',st.boot_mode=='OFF');
   seg('as_1',st.autosave); seg('as_0',!st.autosave);
@@ -779,7 +861,6 @@ async function poll(){
   if(clean('burst')){ set('on',st.on); set('off',st.off); }
   if(clean('gate')){ set('gper',st.period_ns/1000); set('gdty',st.duty_ppm/1e4); }
   if(clean('elong')){ set('elr',st.elong_ratio||1); }
-  if(clean('ph')){ $('phn').value=st.phase_len; }
   if(clean('r1')&&st.ramp1_active){
     $('r1s').value=(st.ramp1_step_ns/1000).toFixed(3);
     $('r1b').value=st.ramp1_bursts;

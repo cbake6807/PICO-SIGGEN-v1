@@ -100,6 +100,67 @@ and the low phase does `mov osr, isr` + a full-width OUT, replacing
 `mov osr, null`. Same instruction count in the loop, so `hi` and `lo` do not
 move; only the mute constant does, per the section above.
 
+## `set pins, n` has the same masking rule, and that is useful
+
+The OUT finding above has a SET counterpart, and this time the masking is the
+feature rather than the trap:
+
+> **SET writes as many bits as the state machine's `SET_COUNT` and zero-fills
+> the rest** — exactly like OUT.
+
+`gate_gen` therefore says `set pins, 31` rather than `set pins, 1`. With the
+1-pin SET group every caller used historically, only bit 0 lands, so it is
+*identical* to the old instruction. With a wider group it drives the whole
+group high together, which is what lets **one** state machine carry all three
+channel pins in sweep mode — not merely synchronised but the same instruction,
+so there is no inter-channel skew to drift and no path where one pin is left
+asserted while the others change.
+
+If you narrow that immediate back to 1, the sweep silently drops to channel 1
+only. Measure before assuming otherwise.
+
+## The frequency sweep changes the divider, not the counts
+
+`FSWEEP` walks a continuous 50 % square from ~0 to a ceiling and back, with no
+gating at all. The obvious implementation — recompute hi/lo and restart the
+state machine on every step — is wrong in a way that only shows up on a scope:
+`gate_gen` pulls its hi/lo once and then loops on registers, so changing the
+counts means re-initing the SM, which resets its program counter and emits a
+**runt pulse on every single step of the sweep**.
+
+Writing `CLKDIV` on a **live** state machine instead changes the rate with no
+restart and no runt: the half-cycle in flight simply finishes at the new rate.
+It also holds the duty at *exactly* 50 % across the whole band, because hi and
+lo stay equal integers and only the clock feeding them moves. Measured on a
+scope at 1.8 k, 3.2 k, 4.5 k and 5.9 kHz: `DUTY 50.00` at every point.
+
+Deliberately **not** followed by `pio_sm_clkdiv_restart()`. Restarting the
+divider is what re-aligns phase, and re-aligning phase a thousand times a
+second is the glitch this design exists to avoid.
+
+The bottom of the band is not DC. The divider saturates at 65536, so with a
+10 kHz ceiling the floor is **0.153 Hz** — the readout says so rather than
+printing 0.
+
+## Channels are a mask, not a count
+
+`phaseLen` used to be the only channel state, and a count can only ever mean
+"the first n". That is no use the first time a channel's driver fails: you need
+2 and 3 without 1. `phaseMask` is now the source of truth and `phaseLen` is its
+derived popcount, so every existing readout and the ring-length maths carry on
+unchanged. A bare count still means "the first n", and goes through
+`setPhaseMask()` so the two can never drift apart.
+
+A deselected channel is held low **at the pad** (`GPIO_OVERRIDE_LOW`) in every
+mode, not merely left out of the DMA tables. The tables already avoid it, so
+this is belt and braces — but that is the right posture for a pin whose
+transistor has already let go once: no table bug, no half-applied mode change
+and no stale latched code can put it back into conduction.
+
+Pad overrides must be applied **after** any `pio_gpio_init()` on the same pad.
+`gpio_set_function()` zeroes every CTRL field except FUNCSEL, so an override
+set earlier is silently wiped — the same trap the pulse inverter has to dodge.
+
 ## Measuring a pin: duty, not a single sample
 
 `DIAG` reports each output's percentage of a 200 ms window rather than its level.
@@ -111,6 +172,20 @@ The window is a whole number of patterns only by luck, so the figure is
 quantised by how many bursts fall inside it. At 100 kHz / ON 10 / OFF 90 a 50 ms
 window read a true 33 % as either 20 % or 40 %; 200 ms keeps that error small
 enough not to mislead.
+
+**Once the pattern is longer than the window the figures stop meaning anything
+at all.** A slow carrier can push the pattern into the tens of seconds, and a
+marker genuinely high for 49 s out of 113 s then reads **0.0 %** here — which
+looks exactly like a dead pin. `DIAG` now prints how many patterns the 200 ms
+window actually covered and warns below two, because that misreading cost a
+long detour once.
+
+For the same reason `DIAG` reports the cycle pin's pad registers and the PIO's
+own `padoe`/`padout`. Those separate the three causes a 0 % reading can have:
+the state machine is not driving the pin, it is driving it and the table is
+wrong, or it is driving it correctly and something external is holding it down.
+Only the last one is a hardware fault, and nothing else in the readout can tell
+you that is what you are looking at.
 
 ## The 100-pulse cap
 

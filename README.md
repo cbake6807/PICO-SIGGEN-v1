@@ -366,11 +366,16 @@ T <us>         TIME: gate period        G <Hz>    TIME: gate frequency
 D <pct>        TIME: gate duty          W <us>    TIME: gate open width
 I              invert gate              V         invert pulse polarity
 
+FSWEEP <ms>    continuous 0-HI-0 frequency sweep, 50% duty, NO gating
+FSWEEP HI <hz> top of the sweep band (default 10000)
+FSWEEP / OFF   report / back to the gated train
+
 ELONGATE <r>   each pulse grows, total span r across the burst
 ELONGATE PHI   golden-ratio growth per pulse
 ELONGATE OFF   flat train of the base pulses
 SEQ 1,1 2,1 4,1      explicit per-pulse widths, t1_us,t2_us[,amp]
 SEQ / SEQ OFF        print the table / drop it
+PHASE CH 2 3         pick channels explicitly (disabled ones held low)
 TRAIN 100 75 50 25   per-burst amplitude ring, % of base T1
 TRAIN / TRAIN OFF    print the ring / every burst identical
 RAMP1 <step_us> <bursts> <limit_us> [STOP|WRAP]   sweep T1 across bursts

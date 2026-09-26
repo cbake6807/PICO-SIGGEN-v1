@@ -292,7 +292,7 @@ static const uint16_t gate_gen_insns[] = {
   0xa0c7,  //  1: mov  isr, osr
   0x80a0,  //  2: pull block          OSR = high-1
   0xa027,  //  3: mov  x, osr       cycle:
-  0xe001,  //  4: set  pins, 1
+  0xe01f,  //  4: set  pins, 31     all bits of the SET group -- see the .pio
   0x0045,  //  5: jmp  x--, 5      hi:
   0xa046,  //  6: mov  y, isr
   0xe000,  //  7: set  pins, 0
@@ -403,6 +403,11 @@ static const pio_program_t elongate_program = {
 static PIO  pioGate = nullptr;  static uint smGate = 0;  static uint offGating = 0;
 static PIO  pioGen  = nullptr;  static uint smGen  = 0;  static uint offGen    = 0;
 static uint smCarrier = 0;
+// Third generator, claimed only for the frequency sweep. pioGen has four state
+// machines and the normal paths use two, so this costs nothing anyone else
+// wanted. -1 = none available; the sweep then runs on GP5/GP2 alone rather
+// than refusing to start.
+static int  smSweepCh = -1;
 static bool pioReady  = false;
 
 static PIO  pioElong = nullptr; static uint smElong = 0; static uint offElong = 0;
@@ -476,6 +481,35 @@ static int64_t  sweepStepNs  = 200;      // 0.2 us per step
 static uint32_t sweepBursts  = 50;
 static uint64_t sweepLimitNs = 9000;     // 9 us
 static bool     sweepWrap    = true;
+
+// ---- Continuous frequency sweep -------------------------------------------
+//
+// A different animal from RAMP1/RAMP2 above. Those step the carrier BETWEEN
+// bursts. This throws the gating away entirely and walks a continuous 50%
+// square from ~0 up to a ceiling and back, forever -- the "find the resonance"
+// mode: no bursts to correlate, just one tone moving through the band while
+// you watch a current probe.
+//
+// Frequency comes from the PIO CLOCK DIVIDER, not from new counts. gate_gen
+// pulls its hi/lo once and then loops on registers, so changing the counts
+// means re-initing the state machine -- which resets its program counter and
+// emits a runt pulse on every single step of the sweep. Writing CLKDIV on a
+// LIVE state machine instead changes the rate with no restart and no runt: the
+// half-cycle in flight simply finishes at the new rate. It also holds the duty
+// at EXACTLY 50% across the whole sweep, because hi and lo stay equal integers
+// and only the clock feeding them moves.
+static bool     fsweepOn       = false;
+static uint32_t fsweepPeriodMs = 2000;    // one full 0 -> hi -> 0 -> cycle
+static uint32_t fsweepHiHz     = 10000;   // ceiling of the sweep
+static uint32_t fsweepHalf     = 0;       // PIO cycles per half period at div 1
+static uint64_t fsweepT0Us     = 0;
+static double   fsweepNowHz    = 0.0;     // published for the readout
+static bool     fsweepRising   = true;
+
+static const uint32_t FSWEEP_MS_MIN = 50;
+static const uint32_t FSWEEP_MS_MAX = 120000;
+static const uint32_t FSWEEP_HI_MIN = 10;
+static const uint32_t FSWEEP_HI_MAX = 2000000;
 
 static RampCfg ramp1;   // T1 = carrier ON width
 static RampCfg ramp2;   // T2 = carrier OFF width (space)
@@ -598,6 +632,7 @@ static void gateStop() {
   pio_sm_set_enabled(pioGate, smGate,    false);
   pio_sm_set_enabled(pioGen,  smGen,     false);
   pio_sm_set_enabled(pioGen,  smCarrier, false);
+  if (smSweepCh >= 0) pio_sm_set_enabled(pioGen, (uint)smSweepCh, false);
   if (elongPioReady) {
     pio_sm_set_enabled(pioElong, smElong, false);
     dma_channel_abort(elongDmaChan);
@@ -656,19 +691,116 @@ static void genCycles(uint64_t periodNs, uint32_t dutyPpm, bool invert,
 
 // Bring up one gate_gen state machine on `pin`. FIFO pushes must follow
 // pio_sm_init(), which clears the FIFOs.
-static void startGen(uint sm, uint pin, uint32_t div, uint32_t hi, uint32_t lo) {
-  pio_gpio_init(pioGen, pin);
-  pio_sm_set_consecutive_pindirs(pioGen, sm, pin, 1, true);
+// `count` consecutive pins, all driven with the same waveform from one state
+// machine. Everything except the frequency sweep passes 1.
+static void startGenPins(uint sm, uint pin, uint count,
+                         uint32_t div, uint32_t hi, uint32_t lo) {
+  for (uint i = 0; i < count; i++) pio_gpio_init(pioGen, pin + i);
+  pio_sm_set_consecutive_pindirs(pioGen, sm, pin, count, true);
 
   pio_sm_config g = pio_get_default_sm_config();
   sm_config_set_wrap(&g, offGen, offGen + gate_gen_program.length - 1);
-  sm_config_set_set_pins(&g, pin, 1);
+  sm_config_set_set_pins(&g, pin, count);
   sm_config_set_clkdiv_int_frac(&g, div, 0);
 
   pio_sm_init(pioGen, sm, offGen, &g);
   pio_sm_put_blocking(pioGen, sm, lo - 4);   // consumed by pull #1
   pio_sm_put_blocking(pioGen, sm, hi - 3);   // consumed by pull #2
   pio_sm_set_enabled(pioGen, sm, true);
+}
+
+static void startGen(uint sm, uint pin, uint32_t div, uint32_t hi, uint32_t lo) {
+  startGenPins(sm, pin, 1, div, hi, lo);
+}
+
+// Half-period in PIO cycles at divider 1. The two halves must be EQUAL
+// integers or the duty is not exactly 50%, so the period is forced even and
+// split down the middle; the achieved ceiling is reported back rather than the
+// one that was asked for.
+static uint32_t fsweepHalfCycles(uint32_t hiHz) {
+  const uint64_t sys = clock_get_hz(clk_sys);
+  uint64_t period = hiHz ? sys / hiHz : 15000ULL;
+  if (period < 10) period = 10;         // keeps startGen's lo-4 at 1 or more
+  uint32_t half = (uint32_t)(period / 2);
+  return half < 5 ? 5 : half;
+}
+
+static double fsweepTopHz() {
+  return fsweepHalf ? (double)clock_get_hz(clk_sys) / (2.0 * (double)fsweepHalf)
+                    : 0.0;
+}
+
+// frac 0..1 across the sweep band. Divider only -- see the note at fsweepOn.
+static void fsweepApply(double frac) {
+  const double top = fsweepTopHz();
+  const double hz  = frac * top;
+
+  // div = top/hz, so hz -> 0 saturates the divider instead of dividing by
+  // zero. The floor that lands on is top/65536 -- 0.15 Hz at a 10 kHz ceiling,
+  // which is "zero" for bench purposes and is reported as the real number
+  // rather than as 0.
+  double divf = (hz > 0.0) ? (top / hz) : 65536.0;
+  if (divf < 1.0)      divf = 1.0;
+  if (divf > 65535.99) divf = 65535.99;
+
+  uint32_t di = (uint32_t)divf;
+  uint32_t df = (uint32_t)((divf - (double)di) * 256.0 + 0.5);
+  if (df > 255)   { df = 0; di++; }
+  if (di > 65535) { di = 65535; df = 255; }
+  if (di == 0)    { di = 1; }           // 0 means 65536 in hardware -- never
+
+  // Deliberately WITHOUT pio_sm_clkdiv_restart(): restarting the divider is
+  // what re-aligns phase, and re-aligning phase a thousand times a second is
+  // precisely the glitch this whole approach exists to avoid.
+  pio_sm_set_clkdiv_int_frac(pioGen, smGen,     (uint16_t)di, (uint8_t)df);
+  pio_sm_set_clkdiv_int_frac(pioGen, smCarrier, (uint16_t)di, (uint8_t)df);
+  if (smSweepCh >= 0)
+    pio_sm_set_clkdiv_int_frac(pioGen, (uint)smSweepCh, (uint16_t)di, (uint8_t)df);
+  fsweepNowHz = top / ((double)di + (double)df / 256.0);
+}
+
+static void ampParkPins();
+
+static void fsweepStart() {
+  ringLen = 0;
+  ampParkPins();
+  fsweepHalf = fsweepHalfCycles(fsweepHiHz);
+
+  // Equal hi and lo -- the 50% the mode promises, exact at every frequency.
+  // GP5 is the output you drive things with; GP2 stays the carrier monitor it
+  // is in every other mode, so a probe already there keeps working.
+  startGen(smGen,     PIN_GATED_OUT, 1, fsweepHalf, fsweepHalf);
+  startGen(smCarrier, PIN_CARRIER,   1, fsweepHalf, fsweepHalf);
+
+  // All three channel pins carry the sweep, together -- the same arrangement
+  // PHASE SYNC already makes, which is how this rig is driven. A sweep that
+  // only appeared on GP5 would never reach the coils it exists to excite.
+  //
+  // One state machine drives all three, so they are not merely synchronised,
+  // they are the same instruction: there is no skew between them to drift,
+  // and no way for one to be left asserted if something goes wrong mid-change.
+  //
+  // Worth knowing rather than worth preventing: three legs conducting at once
+  // is three times the draw on the shared rail. On a topology where these are
+  // taps of ONE winding rather than separate cells, simultaneous conduction
+  // shorts the turns between the taps -- that is what the one-hot decoder in
+  // the normal channel path is for, and it is bypassed here.
+  if (smSweepCh >= 0)
+    startGenPins((uint)smSweepCh, ampBase, AMP_BITS, 1, fsweepHalf, fsweepHalf);
+
+  // GP4 keeps its scope-trigger job but marks the SWEEP, not a burst: high
+  // through the up-sweep, low through the down-sweep. One edge pair per cycle
+  // to trigger on, and its level tells you which direction you are watching.
+  gpio_set_function(PIN_GATE_OUT, GPIO_FUNC_SIO);
+  gpio_set_dir(PIN_GATE_OUT, GPIO_OUT);
+  gpio_put(PIN_GATE_OUT, 1);
+
+  gpio_set_outover(PIN_GATED_OUT,
+                   pulseInvert ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL);
+  applyChanMaskPads();          // after startGenPins' pio_gpio_init, not before
+  fsweepT0Us   = time_us_64();
+  fsweepRising = true;
+  fsweepApply(0.0);          // start at the bottom, not at whatever div 1 is
 }
 
 // Defined down in the settings section; applyGate() is the one funnel every
@@ -686,6 +818,11 @@ static void applyGate() {
     gateParkPins();
     return;
   }
+
+  // Checked before elongation, not alongside it: the sweep replaces the whole
+  // carrier+gate arrangement rather than layering on it. There is no burst to
+  // gate, no ring to rotate and no per-pulse table -- one continuous tone.
+  if (fsweepOn) { fsweepStart(); return; }
 
   // Elongation owns pulse generation itself (a burst's worth of T1/T2 pairs
   // it streams from its own table), so it fully replaces the normal
@@ -708,6 +845,7 @@ static void applyGate() {
   // only that engine drives.
   ringLen = 0;
   ampParkPins();
+  applyChanMaskPads();
 
   // Internal carrier first, so the gating SM has something to read the instant
   // it starts. Its pin doubles as a plain sig-gen output you can tap.
@@ -823,8 +961,54 @@ static volatile uint32_t trainIdx = 0;      // which table the NEXT burst uses
 //   PH_SYNC    all channels fire together on every burst
 enum PhaseMode : uint8_t { PH_OFF = 0, PH_ROTATE = 1, PH_SYNC = 2 };
 static uint8_t  phaseMode = PH_OFF;
-static uint32_t phaseLen  = 3;              // channels in use, 1..AMP_BITS
+// WHICH channels, not just how many. A count can only ever mean "the first n",
+// which is no use once one channel's driver is dead: you need 2 and 3 without
+// 1. phaseLen is kept as the derived popcount so every existing readout and
+// the ring-length maths carry on working unchanged.
+static uint8_t  phaseMask = (uint8_t)AMP_MASK;   // bit i = GP18+i
+static uint32_t phaseLen  = 3;              // channels in use == popcount(mask)
 static inline bool phaseOn() { return phaseMode != PH_OFF; }
+
+static uint32_t phaseCount() {
+  uint32_t n = 0;
+  for (uint i = 0; i < AMP_BITS; i++) if (phaseMask & (1u << i)) n++;
+  return n;
+}
+
+// Bit of the i-th ENABLED channel, so ROTATE walks only what is switched on.
+// With channel 1 disabled it alternates GP19/GP20 instead of spending a third
+// of every cycle driving a pin that goes nowhere.
+static uint32_t nthChanBit(uint32_t i) {
+  const uint32_t n = phaseCount();
+  if (!n) return 0;
+  i %= n;
+  for (uint32_t b = 0; b < AMP_BITS; b++)
+    if (phaseMask & (1u << b)) { if (!i) return 1u << b; i--; }
+  return 0;
+}
+
+static void setPhaseMask(uint8_t m) {
+  m &= (uint8_t)AMP_MASK;
+  if (!m) m = (uint8_t)AMP_MASK;      // never leave zero channels selected
+  phaseMask = m;
+  phaseLen  = phaseCount();
+}
+
+// Force disabled channels low AT THE PAD, in every mode. The tables and the
+// sweep already avoid them, so this is belt and braces -- but that is the
+// right posture for a pin whose transistor has already let go once: no table
+// bug, no half-applied mode change and no stale latched code can put a
+// disabled channel back into conduction.
+//
+// Must run AFTER any pio_gpio_init() on these pads. gpio_set_function() zeroes
+// every CTRL field except FUNCSEL, so an override set earlier is silently
+// wiped -- the same trap the pulse inverter has to dodge.
+static void applyChanMaskPads() {
+  for (uint i = 0; i < AMP_BITS; i++)
+    gpio_set_outover(ampBase + i,
+                     (phaseMask & (1u << i)) ? GPIO_OVERRIDE_NORMAL
+                                             : GPIO_OVERRIDE_LOW);
+}
 
 
 
@@ -865,7 +1049,7 @@ static uint32_t seqLen = 0;
 //      burn that in an afternoon, so a save happens at most once per editing
 //      session and only if the bytes actually differ.
 static const uint32_t CFG_MAGIC    = 0x47504C53UL;   // 'GPLS'
-static const uint16_t CFG_VERSION  = 4;   // 4: ELONG_MAX_PULSES 25 -> 100
+static const uint16_t CFG_VERSION  = 5;   // 5: continuous frequency sweep
 // Still one 4 KB flash sector -- the core erases and rewrites the whole sector
 // either way, so this costs no extra wear and no extra write time, only a
 // larger staging buffer during begin()/end().
@@ -902,6 +1086,17 @@ struct __attribute__((packed)) Settings {
 
   uint8_t  trainAmp[TRAIN_MAX];
   SeqStep  seqSteps[ELONG_MAX_PULSES];
+
+  uint8_t  fsweepOn;
+  uint32_t fsweepPeriodMs;
+  uint32_t fsweepHiHz;
+
+  // Spare, zero-filled. Every field added past the end changes sizeof and so
+  // forces a CFG_VERSION bump, which throws away the operator's saved setup --
+  // twice in a week is twice too often. Take bytes from here instead and the
+  // layout, and therefore their settings, survive.
+  uint8_t  phaseMask;
+  uint8_t  reserved[23];
 
   uint32_t crc;                                     // must stay LAST
 };
@@ -947,8 +1142,12 @@ static void cfgCapture(Settings &s) {
   s.elongActive   = elong.active ? 1 : 0;
   s.trainLen      = (uint8_t)trainLen;
   s.phaseLen      = (uint8_t)phaseLen;
+  s.phaseMask     = phaseMask;
   s.phaseMode     = phaseMode;
   s.interlockEnabled = interlockEnabled ? 1 : 0;
+  s.fsweepOn       = fsweepOn ? 1 : 0;
+  s.fsweepPeriodMs = fsweepPeriodMs;
+  s.fsweepHiHz     = fsweepHiHz;
   s.seqLen        = (uint8_t)seqLen;
 
   s.onCount        = onCount;
@@ -998,7 +1197,14 @@ static void cfgApply(const Settings &s) {
   elong.active = s.elongActive && elongPioReady;
 
   trainLen = (s.trainLen <= TRAIN_MAX) ? s.trainLen : 0;
-  phaseLen  = (s.phaseLen >= 1 && s.phaseLen <= AMP_BITS) ? s.phaseLen : 3;
+  // Blobs written before the mask existed have a zeroed reserved[] block, so
+  // a zero mask is not "no channels" -- it is "this save predates the field".
+  // Rebuild it from the count, which is what it used to mean.
+  {
+    uint32_t pl = (s.phaseLen >= 1 && s.phaseLen <= AMP_BITS) ? s.phaseLen : 3;
+    uint8_t  pm = (uint8_t)(s.phaseMask & AMP_MASK);
+    setPhaseMask(pm ? pm : (uint8_t)((1u << pl) - 1u));
+  }
   phaseMode = (s.phaseMode <= PH_SYNC) ? s.phaseMode : PH_OFF;
 
   // Restored armed-but-tripped, never armed-and-live. Whatever the enclosure
@@ -1006,6 +1212,14 @@ static void cfgApply(const Settings &s) {
   // look at it and say ARM.
   interlockEnabled = s.interlockEnabled ? true : false;
   interlockTripped = interlockEnabled;
+
+  fsweepOn       = s.fsweepOn ? true : false;
+  fsweepPeriodMs = (s.fsweepPeriodMs < FSWEEP_MS_MIN) ? FSWEEP_MS_MIN
+                 : (s.fsweepPeriodMs > FSWEEP_MS_MAX) ? FSWEEP_MS_MAX
+                 : s.fsweepPeriodMs;
+  fsweepHiHz     = (s.fsweepHiHz < FSWEEP_HI_MIN) ? FSWEEP_HI_MIN
+                 : (s.fsweepHiHz > FSWEEP_HI_MAX) ? FSWEEP_HI_MAX
+                 : s.fsweepHiHz;
   for (uint32_t i = 0; i < TRAIN_MAX; i++)
     trainAmp[i] = (s.trainAmp[i] >= 1 && s.trainAmp[i] <= 100) ? s.trainAmp[i] : 100;
 
@@ -1213,7 +1427,8 @@ static void elongBuildAll() {
   const uint32_t tl = trainLen ? trainLen : 1;
   // SYNC fires every channel on every burst, so it adds no per-burst variation
   // and contributes 1 to the ring length -- only ROTATE walks the channels.
-  const uint32_t pl = (phaseMode == PH_ROTATE) ? (phaseLen ? phaseLen : 1) : 1;
+  const uint32_t pc = phaseCount();
+  const uint32_t pl = (phaseMode == PH_ROTATE) ? (pc ? pc : 1) : 1;
 
   if (!trainLen && !phaseOn()) {         // neither sequence armed: one table
     ringLen = 0;
@@ -1232,8 +1447,8 @@ static void elongBuildAll() {
   for (uint32_t k = 0; k < n; k++) {
     const double  scale = trainLen ? (double)trainAmp[k % tl] / 100.0 : 1.0;
     int32_t mask = -1;                                   // -1 = SEQ tap codes
-    if (phaseMode == PH_ROTATE)    mask = (int32_t)(1u << (k % pl));
-    else if (phaseMode == PH_SYNC) mask = (int32_t)((1u << phaseLen) - 1u);
+    if (phaseMode == PH_ROTATE)    mask = (int32_t)nthChanBit(k);
+    else if (phaseMode == PH_SYNC) mask = (int32_t)(phaseMask & AMP_MASK);
     // Only burst 1, and only when the pattern is actually longer than one burst
     // -- a 1-long ring has nothing to distinguish, and see the note above about
     // a marker that is never rewritten low.
@@ -1310,6 +1525,7 @@ static void elongStart() {
   // pio_gpio_init() above just wiped this, so it must be set after.
   gpio_set_outover(PIN_GATED_OUT,
                    pulseInvert ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL);
+  applyChanMaskPads();
 }
 
 // Arms elongation: forces the preconditions it needs (COUNT+INT) and the
@@ -1426,6 +1642,26 @@ static void rampStep(RampCfg &r, bool isT1) {
 // Called from loop(). Nothing here is timing-critical -- a step landing a
 // fraction late just makes that step's dwell one poll-cycle longer, which is
 // invisible against a "every N bursts" cadence.
+// 1 kHz update. At a 1 s sweep that is ~20 Hz of travel per step, and because
+// each step is a divider write rather than a restart, the output slides rather
+// than stepping -- the granularity shows up as rate, not as edges.
+static void fsweepPoll() {
+  if (!fsweepOn || !pioReady || !outputLive()) return;
+  static uint64_t lastUs = 0;
+  const uint64_t now = time_us_64();
+  if (now - lastUs < 1000) return;
+  lastUs = now;
+
+  const uint64_t perUs = (uint64_t)fsweepPeriodMs * 1000ULL;
+  const double   ph    = (double)((now - fsweepT0Us) % perUs) / (double)perUs;
+  fsweepRising = (ph < 0.5);
+  // Triangle, so the band is swept up and then back down at the same rate --
+  // a sawtooth would snap from the ceiling to zero and ring everything on the
+  // bench at the flyback.
+  fsweepApply(fsweepRising ? ph * 2.0 : (1.0 - ph) * 2.0);
+  gpio_put(PIN_GATE_OUT, fsweepRising ? 1 : 0);
+}
+
 static void pollRamp() {
   uint64_t now = time_us_64();
   if (ramp1.active && (int64_t)(now - ramp1.nextStepAtUs) >= 0) {
@@ -1693,6 +1929,7 @@ static void printJson(Print &o) {
   o.print(cfgBootMode == BOOT_RUN ? "RUN" : cfgBootMode == BOOT_OFF ? "OFF" : "SAVED");
   o.print("\",\"saved\":"); o.print(cfgLastCrc ? 1 : 0);
   o.print(",\"phase_len\":"); o.print(phaseLen);
+  o.print(",\"phase_mask\":"); o.print(phaseMask & AMP_MASK);
   o.print(",\"phase_mode\":\"");
   o.print(phaseMode == PH_SYNC ? "SYNC" : phaseMode == PH_ROTATE ? "ROTATE" : "OFF");
   o.print("\"");
@@ -1756,7 +1993,12 @@ static void printJson(Print &o) {
     if (shz > 0) { o.print(",\"burst_pulses\":"); o.print(openUs * shz / 1e6, 2); }
   }
 
-  o.print(",\"ramp1_active\":"); o.print(ramp1.active ? 1 : 0);
+  o.print(",\"fsweep\":");        o.print(fsweepOn ? 1 : 0);
+  o.print(",\"fsweep_ms\":");     o.print(fsweepPeriodMs);
+  o.print(",\"fsweep_hi_hz\":");  o.print((uint32_t)(fsweepTopHz() + 0.5));
+  o.print(",\"fsweep_hz\":");     o.print(fsweepNowHz, 2);
+  o.print(",\"fsweep_dir\":\"");  o.print(fsweepRising ? "up" : "down");
+  o.print("\",\"ramp1_active\":"); o.print(ramp1.active ? 1 : 0);
   if (ramp1.active) {
     o.print(",\"ramp1_t1_ns\":");    printU64(o, currentT1Ns());
     o.print(",\"ramp1_step_ns\":");  o.print((double)ramp1.stepNs, 0);
@@ -1855,6 +2097,66 @@ static void printDiag(Print &o) {
   printPinDuty(o, "chan  ", ampBase + 1);
   printPinDuty(o, "chan  ", ampBase + 2);
   printPinDuty(o, "cycle ", cyclePin());
+  // Say how much of a pattern the 200 ms window actually covered. Every duty
+  // above is quantised by that, and once the pattern grows past the window the
+  // figures stop meaning anything at all -- a marker that is genuinely high
+  // for 49 s out of 113 s reads 0.0% here, which looks exactly like a dead
+  // pin. That cost a long detour once; it should not cost a second one.
+  {
+    const uint64_t per = (uint64_t)carrierPeriodNs
+                       * (uint64_t)(onCount + offCount)
+                       * (uint64_t)(ringLen ? ringLen : 1);
+    const double patterns = per ? 200e6 / (double)per : 0.0;
+    o.print("window    : 200 ms = "); o.print(patterns, 2);
+    o.print(" patterns (pattern is "); o.print((double)per / 1e6, 1);
+    o.println(" ms)");
+    if (patterns < 2.0)
+      o.println("  ^ TOO SHORT to mean anything -- raise the carrier or shorten"
+                " ON/OFF before trusting the percentages above");
+  }
+  // Pad-level truth for the cycle pin. A duty of 0% has two very different
+  // causes -- the pin is not moving, or we cannot SEE it move because the
+  // pad's input path is off -- and gpio_get() cannot tell them apart. The
+  // sensor node measuring a healthy marker on the wire while this read zero is
+  // exactly the case that needs separating.
+  {
+    const uint cp = cyclePin();
+    o.print("cycle pad GP"); o.print(cp);
+    o.print(" : func=");  o.print((int)gpio_get_function(cp));
+    o.print(" ie=");      o.print((pads_bank0_hw->io[cp] & PADS_BANK0_GPIO0_IE_BITS) ? 1 : 0);
+    o.print(" od=");      o.print((pads_bank0_hw->io[cp] & PADS_BANK0_GPIO0_OD_BITS) ? 1 : 0);
+    o.print(" iso=");     o.print((pads_bank0_hw->io[cp] & (1u << 8)) ? 1 : 0);
+    o.print(" in=");      o.print(gpio_get(cp) ? 1 : 0);
+    o.print(" ctrl=0x");  o.print(io_bank0_hw->io[cp].ctrl, HEX);
+    // The live DMA words, not the pretty-printed flag: [1] is the gap mask and
+    // [2] the first pulse's mask, and CYCLE_MASK (0x10) has to be set in both
+    // for GP22 to go high and stay high across a burst.
+    {
+      const uint32_t *tb = ringLen ? elongRing[0] : elongTable;
+      o.print("  table[0..3]=");
+      for (int q = 0; q < 4; q++) { o.print("0x"); o.print(tb[q], HEX); o.print(" "); }
+      o.print(" CYCLE_MASK=0x"); o.print(CYCLE_MASK, HEX);
+      o.print(" ringLen="); o.print(ringLen);
+    }
+    // What the PIO is ACTUALLY putting on the pads, straight from its debug
+    // registers -- the one view that is not an inference. padoe says whether
+    // the state machine is driving the pin at all; padout says the level it is
+    // driving. A pin with padoe=0 is not being driven no matter how correct
+    // the table and the pad configuration look.
+    {
+      const uint32_t oe = pioElong->dbg_padoe, ou = pioElong->dbg_padout;
+      o.print("  PIO padoe/padout: GP"); o.print(ampBase);
+      o.print("="); o.print((oe >> ampBase) & 1); o.print("/"); o.print((ou >> ampBase) & 1);
+      o.print("  GP"); o.print(ampBase + 1);
+      o.print("="); o.print((oe >> (ampBase+1)) & 1); o.print("/"); o.print((ou >> (ampBase+1)) & 1);
+      o.print("  GP"); o.print(cp);
+      o.print("="); o.print((oe >> cp) & 1); o.print("/"); o.print((ou >> cp) & 1);
+    }
+    o.print("  (chan pad GP"); o.print(ampBase);
+    o.print(" ie=");      o.print((pads_bank0_hw->io[ampBase] & PADS_BANK0_GPIO0_IE_BITS) ? 1 : 0);
+    o.print(" iso=");     o.print((pads_bank0_hw->io[ampBase] & (1u << 8)) ? 1 : 0);
+    o.println(")");
+  }
 }
 
 static void printHelp(Print &o) {
@@ -1892,7 +2194,13 @@ static void printHelp(Print &o) {
   o.println("  TRAIN OFF      every burst identical again");
   o.println("  PHASE ROT <n>  rotate across n pins, one burst each");
   o.println("  PHASE SYNC <n> all n pins fire together every burst");
+  o.println("  PHASE CH <n..> pick channels explicitly, e.g. PHASE CH 2 3");
+  o.println("                 (disabled channels are held low at the pad)");
   o.println("  PHASE OFF      single output on GP5");
+  o.println("  FSWEEP <ms>    continuous 0-HI-0 sweep, 50% duty, NO gating;");
+  o.println("                 <ms> is one full up-and-back, and arms it");
+  o.println("  FSWEEP HI <hz> top of the sweep band (default 10000)");
+  o.println("  FSWEEP / OFF   report / back to the gated train");
   o.println("  SHAPE FD|T12   carrier knobs edit freq/duty, or T1/T2 independently");
   o.println("  ENCLOG <0|1>   live-print every encoder edge/step to serial (debug)");
   o.println("  M <0|1>        mode 0=TIME 1=COUNT (until GP10 is flipped)");
@@ -1919,8 +2227,19 @@ static void printPhase(Print &o) {
   if (!phaseOn()) { o.println("PHASE: off -- single output on GP5"); return; }
   o.print("PHASE ");
   o.print(phaseMode == PH_SYNC ? "SYNC " : "ROTATE ");
-  o.print(phaseLen); o.print(" channels on GP"); o.print(ampBase);
-  if (phaseLen > 1) { o.print("-GP"); o.print(ampBase + phaseLen - 1); }
+  o.print(phaseLen); o.print(" channels -- ");
+  for (uint i = 0, first = 1; i < AMP_BITS; i++)
+    if (phaseMask & (1u << i)) {
+      if (!first) o.print(", ");
+      o.print("ch"); o.print(i + 1); o.print(" GP"); o.print(ampBase + i);
+      first = 0;
+    }
+  for (uint i = 0; i < AMP_BITS; i++)
+    if (!(phaseMask & (1u << i))) {
+      o.print("   (ch"); o.print(i + 1); o.print(" GP"); o.print(ampBase + i);
+      o.print(" DISABLED, held low at the pad)");
+    }
+  o.print("");
   o.println(phaseMode == PH_SYNC ? " -- all together every burst"
                                  : " -- one burst each, rotating");
   if (ringLen > 1) {
@@ -1932,6 +2251,34 @@ static void printPhase(Print &o) {
     o.println(" idle -- pattern is one burst, nothing to mark");
   }
   if (!elong.active) o.println("  (elongation off -- flat pulses)");
+}
+
+static void printFsweep(Print &o) {
+  o.print("FSWEEP "); o.println(fsweepOn ? "ON" : "off");
+  const uint32_t half = fsweepOn ? fsweepHalf : fsweepHalfCycles(fsweepHiHz);
+  const double top = (double)clock_get_hz(clk_sys) / (2.0 * (double)half);
+  o.print("  band     : 0 - "); o.print(top, 1); o.println(" Hz, 50% duty");
+  // The bottom is a real number, not zero: the divider saturates at 65536.
+  o.print("  really   : "); o.print(top / 65536.0, 3);
+  o.println(" Hz at the bottom -- the clock divider runs out, it is not DC");
+  o.print("  cycle    : "); o.print(fsweepPeriodMs);
+  o.println(" ms for a full up-and-back (encoder 2 sets this)");
+  if (fsweepOn) {
+    o.print("  now      : "); o.print(fsweepNowHz, 2);
+    o.print(" Hz, sweeping "); o.println(fsweepRising ? "up" : "down");
+  }
+  o.print("  output   : GP"); o.print(PIN_GATED_OUT);
+  o.print(" continuous, mirrored on GP"); o.print(PIN_CARRIER);
+  if (smSweepCh >= 0) {
+    o.print(" and all "); o.print(AMP_BITS); o.print(" channels GP");
+    o.print(ampBase); o.print("-GP"); o.print(ampBase + AMP_BITS - 1);
+    o.print(" together");
+  }
+  else o.println(" (no spare SM -- channel pins stay parked)");
+  o.print("; GP"); o.print(PIN_GATE_OUT);
+  o.println(" marks the sweep (high = up)");
+  if (fsweepOn)
+    o.println("  ON/OFF, PHASE, ELONGATE and SEQ do nothing while this is on");
 }
 
 // ============================================================================
@@ -2052,6 +2399,24 @@ static void runCommand(char *s, Print &o) {
     // Print what is actually in the DMA tables. Without this, "no output" and
     // "output you cannot see" look identical from the bench, and we spent a
     // while guessing which one we had.
+    // PHASE CH <list> -- pick channels explicitly, e.g. "PHASE CH 2 3" to
+    // rotate across 2 and 3 only. A bare count still means "the first n", so
+    // every existing script and the saved settings keep working.
+    if (hasArg && !strncmp(arg, "CH", 2)) {
+      uint8_t m = 0;
+      for (const char *q = arg + 2; *q; q++)
+        if (*q >= '1' && *q <= '0' + (int)AMP_BITS) m |= 1u << (*q - '1');
+      if (!m) {
+        o.print("ERROR: name at least one channel, 1.."); o.println(AMP_BITS);
+        return;
+      }
+      setPhaseMask(m);
+      if (phaseMode == PH_OFF) phaseMode = PH_ROTATE;   // asking for channels
+      applyGate();                                      // implies wanting them
+      printPhase(o);
+      return;
+    }
+
     if (hasArg && !strcmp(arg, "DUMP")) {
       printPhase(o);
       const uint32_t nt = ringLen ? ringLen : 1;
@@ -2095,12 +2460,28 @@ static void runCommand(char *s, Print &o) {
     if (!strncmp(arg, "SYNC", 4))     { mode = PH_SYNC;   m = arg + 4; }
     else if (!strncmp(arg, "ROT", 3)) { mode = PH_ROTATE; m = arg + 3; }
     while (*m == ' ' || *m == '\t') m++;
-    uint32_t n = *m ? (uint32_t)atoi(m) : phaseLen;
+
+    // A bare "PHASE ROT" / "PHASE SYNC" changes only the MODE and leaves the
+    // channel selection exactly as it is. That is what the mode buttons send,
+    // so flipping offset/sync can never silently re-enable a channel whose
+    // driver you deliberately switched off.
+    if (!*m) {
+      phaseMode = mode;
+      phaseArm();
+      printPhase(o);
+      return;
+    }
+
+    uint32_t n = (uint32_t)atoi(m);
     if (n < 1 || n > AMP_BITS) {
       o.print("ERROR: PHASE [ROT|SYNC] 1.."); o.print(AMP_BITS);
       o.println(", or PHASE OFF"); return;
     }
-    phaseLen = n; phaseMode = mode;
+    // A COUNT still means "the first n", as it always has -- and it has to go
+    // through setPhaseMask, or phaseLen and phaseMask drift apart and the
+    // readout starts claiming channels the tables do not drive.
+    setPhaseMask((uint8_t)((1u << n) - 1u));
+    phaseMode = mode;
     phaseArm();                 // engine up, elongation left exactly as it was
     printPhase(o);
     return;
@@ -2413,6 +2794,39 @@ static void runCommand(char *s, Print &o) {
   // LOCK 0|1 -- enable the enclosure interlock. Enabling always lands tripped,
   // whatever the pin says: arming is a deliberate act, and "I turned it on and
   // it stayed running" teaches the operator the interlock does nothing.
+  // FSWEEP -- continuous 0..HI..0 frequency sweep, 50% duty, no gating.
+  if (!strcmp(s, "FSWEEP")) {
+    if (!hasArg) { printFsweep(o); return; }
+
+    if (!strcmp(arg, "OFF")) {
+      fsweepOn = false; applyGate();
+      o.println("sweep OFF -- back to the gated train");
+      return;
+    }
+    if (!strcmp(arg, "ON")) { fsweepOn = true; applyGate(); printFsweep(o); return; }
+
+    if (!strncmp(arg, "HI", 2)) {
+      double hz = atof(arg + 2);
+      if (hz < FSWEEP_HI_MIN || hz > FSWEEP_HI_MAX) {
+        o.print("ERROR: HI must be "); o.print(FSWEEP_HI_MIN);
+        o.print(".."); o.print(FSWEEP_HI_MAX); o.println(" Hz"); return;
+      }
+      fsweepHiHz = (uint32_t)hz;
+      applyGate(); printFsweep(o); return;
+    }
+
+    // A bare number is the cycle time in ms, and arms the sweep -- the common
+    // case is "sweep, this fast", not "configure now, enable later".
+    if (val < (double)FSWEEP_MS_MIN || val > (double)FSWEEP_MS_MAX) {
+      o.print("ERROR: cycle time must be "); o.print(FSWEEP_MS_MIN);
+      o.print(".."); o.print(FSWEEP_MS_MAX); o.println(" ms");
+      return;
+    }
+    fsweepPeriodMs = (uint32_t)val;
+    fsweepOn = true;
+    applyGate(); printFsweep(o); return;
+  }
+
   if (!strcmp(s, "LOCK")) {
     if (!hasArg) {
       o.print("interlock "); o.print(interlockEnabled ? "ON" : "OFF");
@@ -2505,6 +2919,7 @@ static void runCommand(char *s, Print &o) {
     // oversight: "restore defaults" must never be a way to disarm a safety
     // input. Output comes back on as intent; if the enclosure is open it still
     // will not emit, which is correct.
+    fsweepOn = false;                       // defaults are a gated train
     sigSource = SRC_INT; outputEnabled = true;
     // ROTATE 3, not OFF. "Known state" exists to be pressed when nothing is
     // coming out -- and single mode idles GP18-20 and the GP22 marker, so
@@ -2626,6 +3041,7 @@ static void logEnc1() {
 }
 
 static void logCarrier(const char *which) {
+  if (fsweepOn) return;      // applyEncoder2Step already logged the sweep speed
   if (shapeMode == SHAPE_T12) {
     uint64_t t1 = currentT1Ns(), t2 = currentT2Ns();
     uint64_t v  = (which[0] == 'T') ? t1 : t2;
@@ -2678,6 +3094,21 @@ static void applyEncoderStep(int8_t dir) {
 // Turning it implies SRC INT -- same trap C/CD already close off for the
 // serial API, now closed for the front panel too.
 static void applyEncoder2Step(int8_t dir) {
+  // While the sweep owns the output there is no carrier frequency to set --
+  // it is being swept. Rather than leave the frequency knob dead, it becomes
+  // the sweep speed control, which is the one thing this mode has to tune.
+  if (fsweepOn) {
+    uint32_t bp = encAccelerateBp(enc2LastMs);
+    // Negated like the frequency case: clockwise should mean "faster", and
+    // faster is a SHORTER cycle time.
+    uint64_t v = multiplicativeStep(fsweepPeriodMs, (int8_t)-dir, bp);
+    if (v < FSWEEP_MS_MIN) v = FSWEEP_MS_MIN;
+    if (v > FSWEEP_MS_MAX) v = FSWEEP_MS_MAX;
+    fsweepPeriodMs = (uint32_t)v;
+    cfgTouch();
+    inLogAction("sweep %lu ms/cycle", (unsigned long)fsweepPeriodMs);
+    return;
+  }
   sigSource = SRC_INT;
   uint32_t bp = encAccelerateBp(enc2LastMs);
   if (shapeMode == SHAPE_FD) {
@@ -3168,6 +3599,7 @@ void setup() {
           && pio_claim_free_sm_and_add_program(&gate_gen_program,
                                                &pioGen, &smGen, &offGen);
   if (pioReady) {
+    smSweepCh = pio_claim_unused_sm(pioGen, false);
     int sc = pio_claim_unused_sm(pioGen, false);
     if (sc < 0) pioReady = false; else smCarrier = (uint)sc;
   }
@@ -3240,6 +3672,7 @@ void loop() {
   freqPoll();
   netPoll();
   pollRamp();
+  fsweepPoll();
   cfgPoll(Serial);            // writes at most once per editing session
 
   // Close a one-shot RUN window. Signed compare so it survives millis() wrap.
