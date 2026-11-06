@@ -6,7 +6,7 @@ Meyer Archive.*
 A small Android app that finds the GatedPulse generator on your Wi-Fi and opens
 its control panel. It isn't on the Play Store. You install the APK directly.
 
-**[Download GatedPulse.apk](https://bitbucket.org/cbake6807/dualtripleseq/raw/master/android/GatedPulse.apk)**:
+**[Download GatedPulse.apk](https://github.com/cbake6807/PICO-SIGGEN-v1/raw/main/android/GatedPulse.apk)**:
 the generator's own web page links here too, at the bottom.
 
 Needs Android 7.0 or newer. The phone has to be on the **same Wi-Fi network as
@@ -146,7 +146,7 @@ make apk-install            # ...and adb install -r to a USB-connected phone
 
 To release, bump `VERSION_CODE` and `VERSION_NAME` in `build.sh`, build, then
 commit and push `android/GatedPulse.apk`. The web UI's link always points at
-`master`.
+`main` on GitHub.
 
 **Signing key:** the first build creates `~/.android/gatedpulse-release.jks`,
 outside the repo on purpose. **Back it up.** Phones only accept an update if
