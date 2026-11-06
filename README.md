@@ -36,6 +36,37 @@ needed** — three encoders and two buttons make it a complete instrument.
 | **Sweep** | step T1 across bursts to hunt a resonance |
 | **Persistence** | settings survive power-off; can start pulsing on power-on |
 | **Web UI** | optional — served by the board itself over WiFi |
+| **Android app** | finds the board on the network and drives it from a phone |
+| **Stream overlay** | a read-only readout for an OBS browser source |
+
+---
+
+## What's new in v2
+
+- **Edits never restart the output.** v1 stopped and restarted every PIO
+  state machine on each change, so dragging a control cut bursts short and
+  the scope looked glitchy. Now a value change (T1/T2, frequency, duty,
+  on/off, gate window, channels, elongation, train) takes effect at the next
+  period or burst boundary while the output keeps running. Only switching mode,
+  source, sweep or one-shot restarts. `LIVE 0` brings back the v1 behaviour,
+  for comparing on a scope.
+- **Firmware updates over WiFi.** Set `OTA_PASS` in `secrets.h`, flash once
+  over USB, then `make ota HOST=<board ip>` from then on.
+- **Rebuilt web UI.** A *drive* tab with encoder-style controls for T1, T2,
+  the modes and the burst; a fixed status table in the header; and a banner
+  and dimmed controls when the board stops answering. The page reloads itself
+  after a firmware update.
+- **Android app** (`android/`): finds the board by mDNS, keeps retrying the
+  board you picked, and buzzes when the connection drops or comes back.
+  [Download the APK](https://github.com/cbake6807/PICO-SIGGEN-v1/raw/main/android/GatedPulse.apk);
+  install steps are in [android/README.md](android/README.md).
+- **`/overlay`**: a transparent read-only readout for OBS. Use
+  `/overlay` as a 1920×260 browser source, or `/overlay?v=card` at 460×330.
+- **`PULSE <t1_us> <t2_us>`** sets T1 and T2 in one step. The firmware
+  version and build show in `P`, `/state` and the page footer.
+- **Changes from v1 to check:** ON and OFF counts are now capped at 65535 each.
+  The flash layout changes to 2 MB sketch + 2 MB filesystem (`make` does this).
+  Saved settings carry over.
 
 ---
 
@@ -488,8 +519,11 @@ Nothing here is safety-rated. See [LICENSE](LICENSE).
 GatedPulsePico/
   GatedPulsePico.ino     the firmware
   webui.h                the onboard web UI (PROGMEM HTML)
+  overlay.h              /overlay, the read-only stream overlay
   *.pio                  readable PIO sources — see below
-  secrets.h.example      copy to secrets.h for WiFi
+  secrets.h.example      copy to secrets.h for WiFi (and OTA_PASS)
+android/                 the Android app: one Java file, built without Gradle
+SensorNode/              firmware for the optional second (sensor) board
 HARDWARE.md              pin map, wiring, what every knob does
 AMPLITUDE_SEQUENCING.md  driving a VIC, amplitude control, HV parts
 docs/DESIGN_NOTES.md     why the firmware is built this way; PIO gotchas

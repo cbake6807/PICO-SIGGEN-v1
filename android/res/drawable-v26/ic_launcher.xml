@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 26+: adaptive icon. The chalk art is full-bleed in the BACKGROUND layer
+     (its own blueprint sheet is the background), so every launcher mask and the
+     open-app zoom show the same picture as the in-app avatar. The old white
+     cut-out over a separate grid layer showed the grid as a square mid-zoom.
+     The themed (monochrome) icon keeps the white outline. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/stan_icon" />
+    <foreground android:drawable="@android:color/transparent" />
+    <monochrome android:drawable="@drawable/ic_fg" />
+</adaptive-icon>

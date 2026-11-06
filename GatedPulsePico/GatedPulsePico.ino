@@ -55,6 +55,8 @@ struct ElongCfg;
 struct SeqStep;
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPUpdateServer.h>
+#include <LittleFS.h>
 #include <LEAmDNS.h>
 
 // WiFi credentials live in secrets.h, which is gitignored. Without it the
@@ -68,6 +70,30 @@ struct SeqStep;
 #endif
 #ifndef MDNS_NAME
   #define MDNS_NAME "gatedpulse"
+#endif
+
+// Which firmware is this? Reported in /state, P and the boot banner, so "is
+// the board running the new page or the old one" is answered by the board
+// rather than guessed from what the UI looks like. FW_BUILD comes from
+// build_info.h, which `make pico` writes from git; a bare arduino-cli build
+// falls back to the compile time.
+#define FW_VERSION "2.0.0"
+#if __has_include("build_info.h")
+  #include "build_info.h"
+#endif
+#ifndef FW_BUILD
+  #define FW_BUILD __DATE__ " " __TIME__
+#endif
+
+// Firmware update over WiFi (POST /update), the way to reflash a board that
+// is wired into a bench rig instead of sitting on the desk by a USB port.
+// Off unless secrets.h sets OTA_PASS -- an unauthenticated flash endpoint on
+// a box that drives high-voltage hardware is not a default worth shipping.
+#ifndef OTA_USER
+  #define OTA_USER "gatedpulse"
+#endif
+#ifndef OTA_PASS
+  #define OTA_PASS ""
 #endif
 
 // ---------- Pins ----------
@@ -245,32 +271,35 @@ static inline uint    cyclePin()  { return ampBase + CYCLE_BIT; }   // GP22
 // the remainder and starts clean on the next rising edge. Gate closure is
 // likewise deferred to the end of the pulse in flight, at most one input period.
 static const uint16_t gating_insns[] = {
-  0x80a0,  //  0: pull block          OSR = OFF-1
-  0xa0c7,  //  1: mov  isr, osr       stash OFF
-  0x80a0,  //  2: pull block          OSR = ON-1 (stays here)
-  0x2020,  //  3: wait 0 pin 0        sync: begin from a low input
-  0xa027,  //  4: mov  x, osr       burst: reload ON count
-  0xe001,  //  5: set  pins, 1        marker high, output low
-  0x20a0,  //  6: wait 1 pin 0      pass:
-  0xe003,  //  7: set  pins, 3        output follows input
-  0x2020,  //  8: wait 0 pin 0
-  0xe001,  //  9: set  pins, 1
-  0x0046,  // 10: jmp  x--, 6
-  0xe000,  // 11: set  pins, 0        burst over, marker low
-  0xa046,  // 12: mov  y, isr         reload OFF count
-  0x20a0,  // 13: wait 1 pin 0      mute:
-  0x2020,  // 14: wait 0 pin 0
-  0x008d,  // 15: jmp  y--, 13
-  0x0004,  // 16: jmp  4
-  0x00d4,  // 17: jmp  pin, 20     tloop:   <-- TIME entry
-  0xe000,  // 18: set  pins, 0        gate shut, hold low
-  0x0011,  // 19: jmp  17
-  0x2020,  // 20: wait 0 pin 0     topen:
-  0x20a0,  // 21: wait 1 pin 0
-  0xe001,  // 22: set  pins, 1
-  0x2020,  // 23: wait 0 pin 0
-  0xe000,  // 24: set  pins, 0
-  0x0011,  // 25: jmp  17
+  0x2020,  //  0: wait 0 pin 0        sync: begin from a low input  <-- COUNT entry
+  0x8080,  //  1: pull noblock      burst: OSR = new word, or X (current)
+  0xa027,  //  2: mov  x, osr       got:   keep it for the next burst
+  0x6050,  //  3: out  y, 16          Y = ON-1
+  0xe001,  //  4: set  pins, 1        marker high, output low
+  0x20a0,  //  5: wait 1 pin 0      pass:
+  0xe003,  //  6: set  pins, 3        output follows input
+  0x2020,  //  7: wait 0 pin 0
+  0xe001,  //  8: set  pins, 1
+  0x0085,  //  9: jmp  y--, 5
+  0xe000,  // 10: set  pins, 0        burst over, marker low
+  0x6050,  // 11: out  y, 16          Y = OFF
+  0x0072,  // 12: jmp  !y, 18         0 = one-shot -> park
+  0x008e,  // 13: jmp  y--, 14        pre-decrement: mute counts OFF pulses
+  0x20a0,  // 14: wait 1 pin 0      mute:
+  0x2020,  // 15: wait 0 pin 0
+  0x008e,  // 16: jmp  y--, 14
+  0x0001,  // 17: jmp  1
+  0x80a0,  // 18: pull block        park: one-shot done, wait for a word
+  0x0002,  // 19: jmp  2
+  0x00d7,  // 20: jmp  pin, 23     tloop:   <-- TIME entry
+  0xe000,  // 21: set  pins, 0        gate shut, hold low
+  0x0014,  // 22: jmp  20
+  0x2020,  // 23: wait 0 pin 0     topen:
+  0x20a0,  // 24: wait 1 pin 0
+  0xe001,  // 25: set  pins, 1
+  0x2020,  // 26: wait 0 pin 0
+  0xe000,  // 27: set  pins, 0
+  0x0014,  // 28: jmp  20
 };
 static const pio_program_t gating_program = {
   .instructions = gating_insns,
@@ -278,7 +307,7 @@ static const pio_program_t gating_program = {
   .origin       = -1,
 };
 static const uint GATING_ENTRY_COUNT = 0;
-static const uint GATING_ENTRY_TIME  = 17;
+static const uint GATING_ENTRY_TIME  = 20;
 
 // ---- Square-wave generator (gate_gen.pio) --------------------------------
 //
@@ -302,6 +331,36 @@ static const uint16_t gate_gen_insns[] = {
 static const pio_program_t gate_gen_program = {
   .instructions = gate_gen_insns,
   .length       = count_of(gate_gen_insns),
+  .origin       = -1,
+};
+
+// ---- Retunable square wave (carrier_live.pio) -----------------------------
+//
+// gate_gen loads its two counts once, so retuning it meant stopping it and
+// starting a new one: the current pulse was cut short and the burst count
+// downstream restarted. Every edit -- every detent of a drag -- was a glitch.
+//
+// This one re-reads ONE packed word (low half hi-3, high half lo-5) at the top
+// of every period with a nonblocking pull. An empty FIFO makes that pull act
+// as `mov osr, x`, and X holds the current word, so the wave repeats until the
+// CPU posts a new one; then T1 and T2 change together at a period boundary.
+// Used for the internal carrier and for the TIME-mode gate. The frequency
+// sweep keeps gate_gen, which it retunes through the clock divider instead.
+//   hi_cycles = pushed + 3    set pins,31 .. set pins,0
+//   lo_cycles = pushed + 5    set pins,0 .. next set pins,31 (wrap + reload)
+static const uint16_t carrier_live_insns[] = {
+  0x8080,  //  0: pull noblock        OSR = new word, or X (current)  wrap_target
+  0xa027,  //  1: mov  x, osr
+  0x6050,  //  2: out  y, 16          Y = hi-3
+  0xe01f,  //  3: set  pins, 31
+  0x0084,  //  4: jmp  y--, 4       hi:
+  0x6050,  //  5: out  y, 16          Y = lo-5
+  0xe000,  //  6: set  pins, 0
+  0x0087,  //  7: jmp  y--, 7       lo:                               wrap
+};
+static const pio_program_t carrier_live_program = {
+  .instructions = carrier_live_insns,
+  .length       = count_of(carrier_live_insns),
   .origin       = -1,
 };
 
@@ -403,6 +462,13 @@ static const pio_program_t elongate_program = {
 static PIO  pioGate = nullptr;  static uint smGate = 0;  static uint offGating = 0;
 static PIO  pioGen  = nullptr;  static uint smGen  = 0;  static uint offGen    = 0;
 static uint smCarrier = 0;
+// The retunable generators: internal carrier and TIME-mode gate. Their own
+// block, because the program differs from gate_gen's. smCarrier above is
+// still the sweep's GP2 generator.
+static PIO  pioLive = nullptr;  static uint smCarLive = 0, smGateLive = 0, offLive = 0;
+static bool liveReady = false;
+static bool liveOn    = true;    // LIVE 0 forces the old restart-on-every-edit
+                                 // path, for A/B on a scope
 // Third generator, claimed only for the frequency sweep. pioGen has four state
 // machines and the normal paths use two, so this costs nothing anyone else
 // wanted. -1 = none available; the sweep then runs on GP5/GP2 alone rather
@@ -414,7 +480,7 @@ static PIO  pioElong = nullptr; static uint smElong = 0; static uint offElong = 
 static bool elongPioReady = false;
 // Declared up here because applyGate() clears it when it routes to the normal
 // carrier+gate path, and that sits well above the ring itself.
-static uint32_t ringLen = 0;                // 0 = no ring, single table
+static volatile uint32_t ringLen = 0;       // 0 = no ring, single table
 static int  elongDmaChan  = -1;
 
 // ============================================================================
@@ -442,7 +508,10 @@ static ShapeMode shapeMode = SHAPE_FD;
 static uint32_t onCount  = 10;
 static uint32_t offCount = 90;
 static const uint32_t COUNT_MIN = 1;
-static const uint32_t COUNT_MAX = 1000000000UL;
+// 65535: ON and OFF travel to the gating engine as two 16-bit halves of one
+// word, so they change together at a burst boundary without a restart (see
+// gating.pio). At 100 kHz that is still a 0.65 s gap.
+static const uint32_t COUNT_MAX = 65535UL;
 
 // TIME mode. Nanoseconds needs 64 bits now that the range reaches 60 s.
 static uint64_t gatePeriodNs = 10000000ULL;   // 10 ms -> 100 Hz
@@ -627,8 +696,22 @@ static double sourceHz() {
 // Gate engine
 // ============================================================================
 
+// Which engine is running and the setup it was started with. applyGate()
+// compares against this to tell "a value moved" (retune in place, no glitch)
+// from "the arrangement changed" (stop everything and start over).
+enum Engine : uint8_t { ENG_NONE = 0, ENG_NORMAL, ENG_ELONG, ENG_SWEEP };
+static uint8_t runEngine = ENG_NONE;
+static uint8_t runSrc = 0, runMode = 0;
+static bool    runShot = false;
+static uint    runAmpBase = 0;
+
 static void gateStop() {
   if (!pioReady) return;
+  runEngine = ENG_NONE;
+  if (liveReady) {
+    pio_sm_set_enabled(pioLive, smCarLive,  false);
+    pio_sm_set_enabled(pioLive, smGateLive, false);
+  }
   pio_sm_set_enabled(pioGate, smGate,    false);
   pio_sm_set_enabled(pioGen,  smGen,     false);
   pio_sm_set_enabled(pioGen,  smCarrier, false);
@@ -711,6 +794,67 @@ static void startGenPins(uint sm, uint pin, uint count,
 
 static void startGen(uint sm, uint pin, uint32_t div, uint32_t hi, uint32_t lo) {
   startGenPins(sm, pin, 1, div, hi, lo);
+}
+
+// Cycles for carrier_live: each half must fit 16 bits after its offset, so
+// the integer clock divider takes up whatever the longer half needs beyond
+// that. Below ~1 kHz that costs at most 1 part in 65535 of resolution.
+// Returns real hi/lo cycle counts (not the pushed values), like genCycles().
+static void liveCycles(uint64_t periodNs, uint32_t dutyPpm, bool invert,
+                       uint32_t *div, uint32_t *hi, uint32_t *lo) {
+  const uint64_t fsys  = clock_get_hz(clk_sys);
+  uint64_t total = (periodNs * fsys) / 1000000000ULL;
+  if (total < 8) total = 8;                        // 3 high + 5 low minimum
+  uint32_t ppm = invert ? 1000000U - dutyPpm : dutyPpm;
+  uint64_t big = (total * (ppm > 500000U ? ppm : 1000000U - ppm)) / 1000000ULL;
+  uint64_t d   = (big + 65534ULL) / 65535ULL;     // ceil(big / 65535)
+  if (d < 1) d = 1;
+  if (d > 65535) d = 65535;
+  uint64_t t = (total + d / 2) / d;
+  if (t < 8) t = 8;
+  uint64_t h = (t * ppm + 500000ULL) / 1000000ULL;
+  if (h < 3)     h = 3;
+  if (h > t - 5) h = t - 5;
+  if (h > 65538)     h = 65538;
+  if (t - h > 65540) t = h + 65540;
+  *div = (uint32_t)d;
+  *hi  = (uint32_t)h;
+  *lo  = (uint32_t)(t - h);
+}
+
+static inline uint32_t liveWord(uint32_t hi, uint32_t lo) {
+  return ((lo - 5) << 16) | ((hi - 3) & 0xFFFFu);
+}
+
+static void liveStart(uint sm, uint pin, uint32_t div, uint32_t hi, uint32_t lo) {
+  pio_gpio_init(pioLive, pin);
+  pio_sm_set_consecutive_pindirs(pioLive, sm, pin, 1, true);
+  pio_sm_config g = pio_get_default_sm_config();
+  sm_config_set_wrap(&g, offLive, offLive + carrier_live_program.length - 1);
+  sm_config_set_set_pins(&g, pin, 1);
+  sm_config_set_out_shift(&g, true, false, 32);   // right, NO autopull
+  sm_config_set_clkdiv_int_frac(&g, div, 0);
+  pio_sm_init(pioLive, sm, offLive, &g);
+  pio_sm_put_blocking(pioLive, sm, liveWord(hi, lo));
+  pio_sm_set_enabled(pioLive, sm, true);
+}
+
+// Hand a running state machine its next word. Only the NEWEST value matters:
+// anything still queued from an earlier edit is dropped first, so a fast drag
+// at a slow rate cannot build a backlog the output then plays through.
+static void postWord(PIO pio, uint sm, uint32_t w) {
+  if (!pio_sm_is_tx_fifo_empty(pio, sm)) pio_sm_clear_fifos(pio, sm);
+  pio_sm_put(pio, sm, w);
+}
+
+// ON/OFF for the COUNT gating engine. OFF = 0 means one-shot.
+static uint32_t gatingWord() {
+  uint32_t on  = onCount  < COUNT_MIN ? COUNT_MIN : (onCount  > COUNT_MAX ? COUNT_MAX : onCount);
+  uint32_t off = offCount < COUNT_MIN ? COUNT_MIN : (offCount > COUNT_MAX ? COUNT_MAX : offCount);
+  if (gateInvert && !shotMode) { uint32_t t = on; on = off; off = t; }
+  if (shotMode) off = 0;
+  achHiCyc = on; achLoCyc = shotMode ? 0xFFFFFFFFUL : off; achGenDiv = 0;
+  return (off << 16) | ((on - 1) & 0xFFFFu);
 }
 
 // Half-period in PIO cycles at divider 1. The two halves must be EQUAL
@@ -807,9 +951,15 @@ static void fsweepStart() {
 // waveform change goes through, so it is where a save gets armed.
 static void cfgTouch();
 
+static bool applyLive();
+
 static void applyGate() {
   if (!pioReady) return;
   cfgTouch();                 // arm a deferred save; the write happens once quiet
+  // Only a value moved? Retune the running engine in place -- the output never
+  // stops, the burst in flight finishes, and the change lands on the next
+  // period or burst boundary. Everything else falls through to a restart.
+  if (applyLive()) return;
   gateStop();
 
   // gateParkPins() takes the channel pins and the cycle marker down with it,
@@ -822,7 +972,7 @@ static void applyGate() {
   // Checked before elongation, not alongside it: the sweep replaces the whole
   // carrier+gate arrangement rather than layering on it. There is no burst to
   // gate, no ring to rotate and no per-pulse table -- one continuous tone.
-  if (fsweepOn) { fsweepStart(); return; }
+  if (fsweepOn) { fsweepStart(); runEngine = ENG_SWEEP; return; }
 
   // Elongation owns pulse generation itself (a burst's worth of T1/T2 pairs
   // it streams from its own table), so it fully replaces the normal
@@ -837,6 +987,7 @@ static void applyGate() {
   if ((elong.active || phaseOn()) && elongPioReady
       && sigSource == SRC_INT && gateMode == MODE_COUNT) {
     elongStart();
+    runEngine = ENG_ELONG; runAmpBase = ampBase;
     return;
   }
   // Falling through to the normal carrier+gate path: the ring belongs to the
@@ -851,9 +1002,14 @@ static void applyGate() {
   // it starts. Its pin doubles as a plain sig-gen output you can tap.
   if (sigSource == SRC_INT) {
     uint32_t cdiv, chi, clo;
-    genCycles(carrierPeriodNs, carrierDutyPpm, false, &cdiv, &chi, &clo);
+    if (liveReady) {
+      liveCycles(carrierPeriodNs, carrierDutyPpm, false, &cdiv, &chi, &clo);
+      liveStart(smCarLive, PIN_CARRIER, cdiv, chi, clo);
+    } else {                                   // no spare SM: the old way
+      genCycles(carrierPeriodNs, carrierDutyPpm, false, &cdiv, &chi, &clo);
+      startGen(smCarrier, PIN_CARRIER, cdiv, chi, clo);
+    }
     achCarDiv = cdiv; achCarHi = chi; achCarLo = clo;
-    startGen(smCarrier, PIN_CARRIER, cdiv, chi, clo);
   } else {
     achCarDiv = 0; achCarHi = 0; achCarLo = 0;
     gpio_set_function(PIN_CARRIER, GPIO_FUNC_SIO);
@@ -868,30 +1024,29 @@ static void applyGate() {
   sm_config_set_clkdiv_int_frac(&c, 1, 0);   // full sys clock, lowest latency
 
   if (gateMode == MODE_COUNT) {
-    uint32_t on  = onCount  < COUNT_MIN ? COUNT_MIN : onCount;
-    uint32_t off = shotMode ? 0xFFFFFFFFUL
-                            : (offCount < COUNT_MIN ? COUNT_MIN : offCount);
-    if (gateInvert && !shotMode) { uint32_t t = on; on = off; off = t; }
-    achHiCyc = on; achLoCyc = off; achGenDiv = 0;
 
     // One SET group covers both pins: bit0 = GP4 marker, bit1 = GP5 output.
     pio_gpio_init(pioGate, PIN_GATE_OUT);
     pio_gpio_init(pioGate, PIN_GATED_OUT);
     pio_sm_set_consecutive_pindirs(pioGate, smGate, PIN_GATE_OUT, 2, true);
     sm_config_set_set_pins(&c, PIN_GATE_OUT, 2);
+    sm_config_set_out_shift(&c, true, false, 32);    // right, NO autopull
 
     pio_sm_init(pioGate, smGate, offGating + GATING_ENTRY_COUNT, &c);
-    pio_sm_put_blocking(pioGate, smGate, off - 1);   // pull #1
-    pio_sm_put_blocking(pioGate, smGate, on  - 1);   // pull #2
+    pio_sm_put_blocking(pioGate, smGate, gatingWord());   // first burst's word
     pio_sm_set_enabled(pioGate, smGate, true);
   } else {
     uint32_t div, hi, lo;
-    genCycles(gatePeriodNs, gateDutyPpm, gateInvert, &div, &hi, &lo);
-    achGenDiv = div; achHiCyc = hi; achLoCyc = lo;
-
     // Gate generator owns GP4 here, so the gating SM must not drive it: its
     // SET group is GP5 alone.
-    startGen(smGen, PIN_GATE_OUT, div, hi, lo);
+    if (liveReady) {
+      liveCycles(gatePeriodNs, gateDutyPpm, gateInvert, &div, &hi, &lo);
+      liveStart(smGateLive, PIN_GATE_OUT, div, hi, lo);
+    } else {
+      genCycles(gatePeriodNs, gateDutyPpm, gateInvert, &div, &hi, &lo);
+      startGen(smGen, PIN_GATE_OUT, div, hi, lo);
+    }
+    achGenDiv = div; achHiCyc = hi; achLoCyc = lo;
 
     pio_gpio_init(pioGate, PIN_GATED_OUT);
     pio_sm_set_consecutive_pindirs(pioGate, smGate, PIN_GATED_OUT, 1, true);
@@ -907,6 +1062,51 @@ static void applyGate() {
   // silently wiped. The pad's own inverter costs zero PIO instructions.
   gpio_set_outover(PIN_GATED_OUT,
                    pulseInvert ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL);
+  runEngine = ENG_NORMAL;
+  runSrc = sigSource; runMode = gateMode; runShot = shotMode;
+}
+
+// The no-restart path. Returns true if the change was applied to the running
+// engine; false means the arrangement changed and applyGate() must restart.
+// Everything is computed before anything is posted, so a false return never
+// leaves an engine half-updated.
+static bool applyLive() {
+  if (!liveReady || !liveOn || !outputLive() || fsweepOn) return false;
+
+  const bool wantElong = (elong.active || phaseOn()) && elongPioReady
+                      && sigSource == SRC_INT && gateMode == MODE_COUNT;
+  if (wantElong) {
+    if (runEngine != ENG_ELONG || runAmpBase != ampBase) return false;
+    elongRetune();
+  } else {
+    // A one-shot is a trigger: it restarts on purpose, so it is never live.
+    if (runEngine != ENG_NORMAL || shotMode || runShot
+        || runSrc != sigSource || runMode != gateMode) return false;
+    uint32_t cdiv = 0, chi = 0, clo = 0, gdiv = 0, ghi = 0, glo = 0;
+    if (sigSource == SRC_INT) {
+      liveCycles(carrierPeriodNs, carrierDutyPpm, false, &cdiv, &chi, &clo);
+      if (cdiv != achCarDiv) return false;     // divider change: restart
+    }
+    if (gateMode == MODE_TIME) {
+      liveCycles(gatePeriodNs, gateDutyPpm, gateInvert, &gdiv, &ghi, &glo);
+      if (gdiv != achGenDiv) return false;
+    }
+    if (sigSource == SRC_INT) {
+      achCarHi = chi; achCarLo = clo;
+      postWord(pioLive, smCarLive, liveWord(chi, clo));
+    }
+    if (gateMode == MODE_COUNT) {
+      postWord(pioGate, smGate, gatingWord());
+    } else {
+      achHiCyc = ghi; achLoCyc = glo;
+      postWord(pioLive, smGateLive, liveWord(ghi, glo));
+    }
+  }
+  // Pad-level settings cost nothing to reapply and need no engine change.
+  gpio_set_outover(PIN_GATED_OUT,
+                   pulseInvert ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL);
+  applyChanMaskPads();
+  return true;
 }
 
 // ---- Elongation: per-pulse compounding within one burst -------------------
@@ -915,7 +1115,12 @@ static void applyGate() {
 // words, which is what the expression below spells out. See elongate_insns
 // above for the exact per-phase overhead the -1s compensate for.
 static const uint32_t ELONG_WORDS = 3 + 3 * ELONG_MAX_PULSES;
-static uint32_t elongTable[ELONG_WORDS];
+// Two banks of everything the DMA reads. The live bank is never written: an
+// edit builds the other one and the DMA IRQ switches over at the next burst
+// boundary, so the engine never stops (see elongRetune()). elongTable and
+// elongRing below always point at the live bank, so readers need not care.
+static uint32_t elongTableBank[2][ELONG_WORDS];
+static uint32_t *volatile elongTable = elongTableBank[0];
 static volatile uint32_t elongTableLen = 0;
 
 // ---- Per-train amplitude ring ---------------------------------------------
@@ -942,7 +1147,12 @@ static const uint32_t TRAIN_MAX = 8;
 // channel -- so its length is the lcm of the two, not just the level count.
 // lcm(8,3) = 24 is the worst case, hence the separate cap.
 static const uint32_t RING_MAX  = 24;
-static uint32_t elongRing[RING_MAX][ELONG_WORDS];
+static uint32_t elongRingBank[2][RING_MAX][ELONG_WORDS];
+static uint32_t (*volatile elongRing)[ELONG_WORDS] = elongRingBank[0];
+// Bank handoff between elongRetune() (main loop) and the DMA IRQ.
+static volatile uint8_t  eLive = 0, ePendBank = 0;
+static volatile bool     ePend = false;
+static volatile uint32_t ePendLen = 0, ePendRing = 0;
 static uint8_t  trainAmp[TRAIN_MAX];        // percent of base T1, 1..100
 static uint32_t trainLen = 0;               // 0 = ring off, single table
 static volatile uint32_t trainIdx = 0;      // which table the NEXT burst uses
@@ -1423,7 +1633,7 @@ static uint32_t elongBuildInto(uint32_t *dst, double t1Scale, int32_t chanMask,
 // live rather than a check at each call site.
 static uint32_t cfgGcd(uint32_t a, uint32_t b) { while (b) { uint32_t t = a % b; a = b; b = t; } return a; }
 
-static void elongBuildAll() {
+static void elongBuildBank(uint8_t bank, uint32_t *tableLen, uint32_t *rLen) {
   const uint32_t tl = trainLen ? trainLen : 1;
   // SYNC fires every channel on every burst, so it adds no per-burst variation
   // and contributes 1 to the ring length -- only ROTATE walks the channels.
@@ -1431,11 +1641,11 @@ static void elongBuildAll() {
   const uint32_t pl = (phaseMode == PH_ROTATE) ? (pc ? pc : 1) : 1;
 
   if (!trainLen && !phaseOn()) {         // neither sequence armed: one table
-    ringLen = 0;
+    *rLen = 0;
     // No cycle marker: with one table every burst is identical, so there is no
     // "burst 1" to point at. Marking them all would leave GP22 stuck high --
     // the marker only ever falls when a LATER burst rewrites it low.
-    elongTableLen = elongBuildInto(elongTable, 1.0, -1, false);
+    *tableLen = elongBuildInto(elongTableBank[bank], 1.0, -1, false);
     return;
   }
   // Both sequences advance once per burst but at different rates, so the
@@ -1443,7 +1653,7 @@ static void elongBuildAll() {
   // tables and the IRQ needs nothing but an index.
   uint32_t n = (tl / cfgGcd(tl, pl)) * pl;
   if (n > RING_MAX) n = (tl > RING_MAX) ? RING_MAX : tl;   // pathological only
-  ringLen = n;
+  *rLen = n;
   for (uint32_t k = 0; k < n; k++) {
     const double  scale = trainLen ? (double)trainAmp[k % tl] / 100.0 : 1.0;
     int32_t mask = -1;                                   // -1 = SEQ tap codes
@@ -1452,9 +1662,37 @@ static void elongBuildAll() {
     // Only burst 1, and only when the pattern is actually longer than one burst
     // -- a 1-long ring has nothing to distinguish, and see the note above about
     // a marker that is never rewritten low.
-    elongTableLen = elongBuildInto(elongRing[k], scale, mask, n > 1 && k == 0);
+    *tableLen = elongBuildInto(elongRingBank[bank][k], scale, mask, n > 1 && k == 0);
   }
+}
+
+// Cold start: build bank 0 and make it live. The DMA is stopped here.
+static void elongBuildAll() {
+  uint32_t len = 0, rl = 0;
+  ePend = false;
+  elongBuildBank(0, &len, &rl);
+  eLive = 0;
+  elongTable = elongTableBank[0];
+  elongRing  = elongRingBank[0];
+  elongTableLen = len;
+  ringLen = rl;
   trainIdx = 0;
+}
+
+// Live edit: build the bank the DMA is NOT reading, then hand it to the IRQ,
+// which switches at the next burst boundary. ePend is dropped first so an IRQ
+// landing mid-build keeps playing the live bank instead of taking a half-built
+// one; this runs on the same core as that IRQ, so once ePend reads false the
+// live bank cannot change under us.
+static void elongRetune() {
+  ePend = false;
+  __dmb();
+  const uint8_t b = eLive ^ 1;
+  uint32_t len = 0, rl = 0;
+  elongBuildBank(b, &len, &rl);
+  ePendLen = len; ePendRing = rl; ePendBank = b;
+  __dmb();
+  ePend = true;
 }
 
 // Fires once per burst (when the linear transfer completes, i.e. after the
@@ -1467,6 +1705,19 @@ static void elongBuildAll() {
 // width, and this stays safe to run in an interrupt that fires once per burst.
 static void elongDmaIrqHandler() {
   dma_hw->ints0 = 1u << elongDmaChan;
+  if (ePend) {
+    // A retune is ready: switch banks here, between bursts. The pattern keeps
+    // its place -- burst k+1 of the new ring follows burst k of the old -- so
+    // an edit during ROTATE does not snap the rotation back to channel 1.
+    ePend = false;
+    const uint8_t b = ePendBank;
+    eLive = b;
+    elongTable    = elongTableBank[b];
+    elongRing     = elongRingBank[b];
+    elongTableLen = ePendLen;
+    ringLen       = ePendRing;
+    if (trainIdx >= ringLen) trainIdx = ringLen ? ringLen - 1 : 0;
+  }
   const uint32_t *next = elongTable;
   if (ringLen) {
     uint32_t i = trainIdx + 1;
@@ -1747,6 +1998,7 @@ static void printState(Print &o) {
   uint64_t fsys = clock_get_hz(clk_sys);
 
   o.println("=== GATED PULSE (Pico 2 W / PIO) ===");
+  o.println("firmware  : " FW_VERSION " (" FW_BUILD ")");
   o.print  ("mode      : ");
   o.println(gateMode == MODE_COUNT ? "COUNT (PIO counts input pulses)"
                                    : "TIME  (PIO gate generator)");
@@ -1888,6 +2140,9 @@ static void printJson(Print &o) {
   uint64_t total = (uint64_t)onCount + offCount;
 
   o.print("{\"ok\":1");
+  o.print(",\"fw\":\"" FW_VERSION "\",\"build\":\"" FW_BUILD "\"");
+  // 1 = edits retune the running engine; 0 = no spare PIO, every edit restarts
+  o.print(",\"live_retune\":"); o.print(liveReady && liveOn ? 1 : 0);
   o.print(",\"mode\":\"");  o.print(gateMode == MODE_COUNT ? "COUNT" : "TIME");
   o.print("\",\"src\":\""); o.print(sigSource == SRC_INT ? "INT" : "EXT");
   o.print("\",\"enabled\":");    o.print(outputEnabled ? 1 : 0);
@@ -2051,8 +2306,23 @@ static void printPinDuty(Print &o, const char *label, uint pin) {
   o.print(n ? (100.0 * hi) / n : 0.0, 1); o.println("% of 200ms high");
 }
 
+// What the OTA staging filesystem holds. An update is sized by its FREE space,
+// so a leftover image there is exactly what makes the next upload die partway.
+static void printOtaFs(Print &o) {
+  if (!LittleFS.begin()) { o.println("ota fs    : not mounted"); return; }
+  FSInfo i;
+  LittleFS.info(i);
+  o.print("ota fs    : "); o.print((uint32_t)(i.usedBytes / 1024)); o.print(" KB used of ");
+  o.print((uint32_t)(i.totalBytes / 1024)); o.print(" KB");
+  Dir d = LittleFS.openDir("/");
+  while (d.next()) { o.print("  ["); o.print(d.fileName()); o.print(" ");
+                     o.print((uint32_t)d.fileSize()); o.print("]"); }
+  o.println();
+}
+
 static void printDiag(Print &o) {
   const uint inPin = (sigSource == SRC_INT) ? PIN_CARRIER : PIN_SIG_IN;
+  printOtaFs(o);
 
   uint32_t edges = 0, hi = 0, samples = 0;
   bool prev = gpio_get(inPin);
@@ -2174,6 +2444,8 @@ static void printHelp(Print &o) {
   o.println("  SRC EXT|INT    gate the GP3 sig gen, or the internal carrier");
   o.println("  C <Hz>         internal carrier frequency (implies SRC INT)");
   o.println("  CD <pct>       internal carrier duty");
+  o.println("  PULSE <t1> <t2> carrier as T1/T2 in us, set together (implies SRC INT)");
+  o.println("  LIVE 0|1       1: edits retune without stopping (default); 0: restart each edit");
   o.println("  RAMP1 <step_us> <bursts> <limit_us> [STOP|WRAP]");
   o.println("                 auto-step carrier T1 (width) every N bursts");
   o.println("  RAMP2 ...      same, for T2 (space)");
@@ -2666,6 +2938,16 @@ static void runCommand(char *s, Print &o) {
     return;
   }
 
+  // LIVE 1 (default): edits retune the running engine at the next period or
+  // burst boundary. LIVE 0: every edit stops and restarts it, as v1 did --
+  // kept so the difference can be put side by side on a scope.
+  if (!strcmp(s, "LIVE")) {
+    if (hasArg) liveOn = ((int)val != 0);
+    o.print("live retune "); o.print(liveOn ? "ON" : "OFF");
+    if (!liveReady) o.print(" (unavailable: no spare PIO)");
+    o.println(); return;
+  }
+
   // What the two carrier encoders (ENC2/ENC3) currently edit -- also settable
   // from the dashboard's freq+duty / T1+T2 toggle, so a click there and a
   // press of the ENC2 button on the front panel stay in lockstep either way.
@@ -2695,6 +2977,26 @@ static void runCommand(char *s, Print &o) {
     if (ns < (double)CARRIER_NS_MIN) ns = (double)CARRIER_NS_MIN;
     if (ns > (double)CARRIER_NS_MAX) ns = (double)CARRIER_NS_MAX;
     carrierPeriodNs = (uint64_t)ns;
+    sigSource = SRC_INT;
+    applyGate(); printState(o); return;
+  }
+
+  // PULSE <t1_us> <t2_us>: the pair in ONE step. A T1 edit used to go out as
+  // C then CD -- two engine restarts, and for one round trip in between the
+  // carrier ran at the new period with the OLD duty, so T2 jumped too.
+  if (!strcmp(s, "PULSE")) {
+    double t1 = 0.0, t2 = 0.0;
+    if (!hasArg || sscanf(arg, "%lf %lf", &t1, &t2) != 2 || t1 <= 0.0 || t2 <= 0.0) {
+      o.println("ERROR: PULSE <t1_us> <t2_us>"); return;
+    }
+    double ns = (t1 + t2) * 1000.0;
+    if (ns < (double)CARRIER_NS_MIN) ns = (double)CARRIER_NS_MIN;
+    if (ns > (double)CARRIER_NS_MAX) ns = (double)CARRIER_NS_MAX;
+    double ppm = 1e6 * t1 / (t1 + t2);
+    if (ppm < DUTY_PPM_MIN) ppm = DUTY_PPM_MIN;
+    if (ppm > DUTY_PPM_MAX) ppm = DUTY_PPM_MAX;
+    carrierPeriodNs = (uint64_t)ns;
+    carrierDutyPpm  = (uint32_t)ppm;
     sigSource = SRC_INT;
     applyGate(); printState(o); return;
   }
@@ -3431,12 +3733,24 @@ static void pollSerial() {
 // Network
 // ============================================================================
 
-static WebServer server(80);
-static bool      serverUp = false;
+static WebServer        server(80);
+static HTTPUpdateServer updater;
+static bool             serverUp = false;
 
 // The page itself lives in webui.h -- see the contract note there. The
 // sketch only knows it as a PROGMEM blob to hand to send_P().
 #include "webui.h"
+#include "overlay.h"     // /overlay -- read-only stream overlay for OBS
+
+// Pages only change with the firmware, so the build stamp is an exact ETag:
+// a reload is a 304, not tens of KB over the Pico's radio.
+static void sendPage(const char *html) {
+  static const char *etag = "\"" FW_VERSION "-" FW_BUILD "\"";
+  if (server.header("If-None-Match") == etag) { server.send(304); return; }
+  server.sendHeader("ETag", etag);
+  server.sendHeader("Cache-Control", "no-cache");   // revalidate, never stale
+  server.send_P(200, "text/html", html);
+}
 
 static void handleCmd() {
   String q = server.arg("c");
@@ -3548,11 +3862,15 @@ static void netPoll() {
     Serial.print("wifi: ");   Serial.print(WiFi.SSID());
     Serial.print("  http://"); Serial.print(WiFi.localIP()); Serial.println("/");
     if (!serverUp) {
-      server.on("/", []{ server.send_P(200, "text/html", INDEX_HTML); });
+      server.on("/",        []{ sendPage(INDEX_HTML); });
+      server.on("/overlay", []{ sendPage(OVERLAY_HTML); });
+      if (strlen(OTA_PASS)) updater.setup(&server, "/update", OTA_USER, OTA_PASS);
       server.on("/cmd",   handleCmd);
       server.on("/state", handleState);
       server.on("/inputs", handleInputs);
       server.onNotFound([]{ server.send(404, "text/plain", "no"); });
+      // Variadic form: it also keeps Authorization, which /update needs.
+      server.collectHeaders("If-None-Match");
       server.begin();
       serverUp = true;
     }
@@ -3578,6 +3896,18 @@ static void netPoll() {
 
 void setup() {
   Serial.begin(115200);                 // USB CDC — baud is ignored
+
+  // An OTA image is staged as firmware.bin in LittleFS and the bootloader
+  // flashes it before we get here -- but nothing deletes it afterwards. The
+  // updater sizes the NEXT upload by the FS's free space, so with a ~540 KB
+  // image in a 1 MB FS every second update failed with "Not Enough Space".
+  // Everything goes, not just firmware.bin: an upload that died partway can
+  // leave its partial image, and the FS holds nothing else worth keeping.
+  if (LittleFS.begin()) {
+    Dir d = LittleFS.openDir("/");
+    while (d.next()) LittleFS.remove(d.fileName());
+    LittleFS.end();
+  }
 
   for (uint i = 0; i < count_of(INPUTS); i++) {
     gpio_init(INPUTS[i].gp);
@@ -3620,6 +3950,28 @@ void setup() {
     }
   }
 
+  // The retunable generators LAST, and only from what is genuinely spare.
+  // Claimed first, they took two SMs in the block gate_gen then needed three
+  // of, the carrier claim failed, pioReady went false and the board came up
+  // with no output at all. Now they need a block with the instruction space
+  // AND two free SMs; failing that, liveReady stays false and every edit
+  // restarts the engine, exactly as before -- slower to edit, never dead.
+  {
+    PIO blocks[] = { pio0, pio1, pio2 };
+    for (PIO p : blocks) {
+      if (!pio_can_add_program(p, &carrier_live_program)) continue;
+      int a = pio_claim_unused_sm(p, false);
+      if (a < 0) continue;
+      int b = pio_claim_unused_sm(p, false);
+      if (b < 0) { pio_sm_unclaim(p, (uint)a); continue; }
+      pioLive = p; smCarLive = (uint)a; smGateLive = (uint)b;
+      offLive = pio_add_program(p, &carrier_live_program);
+      liveReady = true;
+      break;
+    }
+  }
+  if (!liveReady) Serial.println("!! no spare PIO for live retune - edits will restart the output");
+
   freqCounterInit();
 
   encState  = (uint8_t)((gpio_get(PIN_ENC_A)  ? 1 : 0) | (gpio_get(PIN_ENC_B)  ? 2 : 0));
@@ -3631,7 +3983,7 @@ void setup() {
   netSetup();
 
   Serial.println();
-  Serial.println("GatedPulsePico - PIO gated pulse train");
+  Serial.println("GatedPulsePico " FW_VERSION " (" FW_BUILD ") - PIO gated pulse train");
   Serial.println("  GP2 carrier   GP3 SIG IN (3.3 V ONLY)   GP4 gate   GP5 gated out");
   Serial.println("  GP11/12/13 carrier freq/T1 encoder+SW   GP14/16/17 carrier duty/T2 encoder+SW");
   if (!pioReady) Serial.println("!! PIO claim FAILED - no free state machines/instruction space");

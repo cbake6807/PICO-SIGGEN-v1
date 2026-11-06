@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="vellum">#14181E</color>
+    <!-- The window paints vellum before the first frame, so a cold start never
+         flashes the platform default between the launcher and our splash. -->
+    <style name="Theme.GatedPulse" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/vellum</item>
+    </style>
+</resources>

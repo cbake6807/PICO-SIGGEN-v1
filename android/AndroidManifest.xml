@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- minSdk / targetSdk / version are passed by build.sh, not set here. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.gatedpulse.app">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- The web UI ticks the motor once per step (navigator.vibrate). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Android 17+ (targetSdk 37): talking to anything on the LAN, the Pico
+         included, needs this runtime permission. Older releases ignore it. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
+    <!-- The Pico speaks plain HTTP on the LAN; there is no TLS to offer. -->
+    <application
+        android:label="GatedPulse"
+        android:icon="@drawable/ic_launcher"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true"
+        android:enableOnBackInvokedCallback="true"
+        android:theme="@style/Theme.GatedPulse">
+
+        <!-- configChanges: rotating must not reload the page and drop
+             whatever the user was halfway through typing into it. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

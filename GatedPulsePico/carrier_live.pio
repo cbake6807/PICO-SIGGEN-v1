@@ -1,0 +1,33 @@
+.program carrier_live
+; Free-running square wave whose T1/T2 can be changed WITHOUT stopping it.
+;
+; gate_gen loads its two counts once and runs on them forever, so the only way
+; to retune it was to stop the state machine and start a new one -- which cut
+; the current pulse short and restarted the burst count downstream, every
+; time, so dragging a control looked like a stream of glitches on the scope.
+;
+; Here both counts travel in ONE word (low half = hi-3, high half = lo-5), and
+; the word is re-read at the top of every period with a NON-blocking pull. A
+; nonblocking pull from an empty FIFO behaves as `mov osr, x`, so X keeps the
+; current word and the wave just repeats. When the CPU posts a new word it
+; lands at the next period boundary, whole: T1 and T2 change together, never
+; one period with the new T1 and the old T2.
+;
+; Halves are 16 bits, so the clock divider absorbs anything longer than
+; 65535 cycles -- see liveCycles() in the sketch.
+;
+;   hi_cycles = pushed_hi + 3   set pins,31 .. set pins,0
+;   lo_cycles = pushed_lo + 5   set pins,0 .. the next set pins,31, including
+;                               the wrap and the three-instruction reload
+.wrap_target
+    pull noblock        ; OSR = new word, or X (the current one) if none posted
+    mov  x, osr         ; X keeps it for the next period's fallback
+    out  y, 16          ; Y = hi-3
+    set  pins, 31       ; whole SET group high (1 pin here, 3 for a group)
+hi:
+    jmp  y--, hi
+    out  y, 16          ; Y = lo-5
+    set  pins, 0
+lo:
+    jmp  y--, lo
+.wrap

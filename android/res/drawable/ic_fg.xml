@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Stan, in the site's chalk line-art (white on transparent, cropped from the
+     stanslegacy.com share image). Inset keeps him inside the 66dp safe zone. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/stan_bust"
+    android:inset="20dp" />

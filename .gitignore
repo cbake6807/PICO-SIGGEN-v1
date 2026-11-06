@@ -20,3 +20,13 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Stamped by `make build` with the git revision; rewritten every build
+GatedPulsePico/build_info.h
+
+# The sensor board's WiFi credentials, same rule as above
+SensorNode/secrets.h
+
+# Android app build output (the APK itself, android/GatedPulse.apk, IS committed:
+# phones download it from the repo)
+android/build/

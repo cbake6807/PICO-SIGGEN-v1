@@ -1,5 +1,5 @@
 ; Both gating engines in one relocatable program so dynamic PIO claiming can
-; never split them across blocks. COUNT entry = offset+0, TIME entry = +17.
+; never split them across blocks. COUNT entry = offset+0, TIME entry = +20.
 ;
 ; SET pin group differs per mode (configured on the SM, not here):
 ;   COUNT: base GP4, count 2  -> bit0 = burst marker, bit1 = gated output
@@ -7,26 +7,44 @@
 .program gating
 
 ; ---- COUNT: pass ON input pulses, mute OFF input pulses ----
-    pull block              ; OSR = OFF-1
-    mov  isr, osr           ; stash OFF
-    pull block              ; OSR = ON-1  (stays here)
+;
+; ON and OFF travel in ONE word (low half = ON-1, high half = OFF), re-read at
+; the top of every burst with a non-blocking pull. An empty FIFO makes that
+; pull act as `mov osr, x`, and X holds the current word, so the pattern just
+; repeats until the CPU posts a new one -- which then takes effect at the next
+; burst boundary, both counts together. The engine never has to be stopped to
+; change them, so a burst is never cut short by an edit.
+;
+; OFF = 0 means one-shot: after this burst, park in a BLOCKING pull until the
+; next word arrives. That replaces the old 0xFFFFFFFF "practically forever"
+; mute, which no longer fits in 16 bits.
+;
+; The CPU puts the first word in the FIFO before enabling the SM.
     wait 0 pin 0            ; sync: begin from a low input
 burst:
-    mov  x, osr             ; reload ON count
+    pull noblock            ; OSR = new word, or X (the current one)
+got:
+    mov  x, osr             ; keep it for the next burst's fallback
+    out  y, 16              ; Y = ON-1
     set  pins, 1            ; marker high, output low
 pass:
     wait 1 pin 0
     set  pins, 3            ; output follows input
     wait 0 pin 0
     set  pins, 1
-    jmp  x--, pass
+    jmp  y--, pass
     set  pins, 0            ; burst over, marker low
-    mov  y, isr             ; reload OFF count
+    out  y, 16              ; Y = OFF
+    jmp  !y, park           ; 0 = one-shot
+    jmp  y--, mute          ; always taken: pre-decrement so mute counts OFF
 mute:
     wait 1 pin 0
     wait 0 pin 0
     jmp  y--, mute
     jmp  burst
+park:
+    pull block              ; one-shot done: hold until the CPU says otherwise
+    jmp  got
 
 ; ---- TIME: AND the input with a gate level read through JMP_PIN ----
 tloop:
