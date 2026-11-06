@@ -58,7 +58,7 @@ needed** — three encoders and two buttons make it a complete instrument.
   after a firmware update.
 - **Android app** (`android/`): finds the board by mDNS, keeps retrying the
   board you picked, and buzzes when the connection drops or comes back.
-  [Download the APK](https://github.com/cbake6807/PICO-SIGGEN-v1/raw/main/android/GatedPulse.apk);
+  [Download the APK](https://raw.githubusercontent.com/cbake6807/PICO-SIGGEN-v1/main/android/GatedPulse.apk);
   install steps are in [android/README.md](android/README.md).
 - **`/overlay`**: a transparent read-only readout for OBS. Use
   `/overlay` as a 1920×260 browser source, or `/overlay?v=card` at 460×330.

@@ -575,7 +575,7 @@ body.offline main,body.offline .hst,body.offline .hbar{opacity:.4;pointer-events
  <!-- The APK lives in the repo, not in flash: the phone fetches it from
       GitHub, so the download needs internet. Hidden inside the app. -->
  <p class=note id=getapp style="margin-top:10px">
-  <a style="color:var(--acc2)" href="https://github.com/cbake6807/PICO-SIGGEN-v1/raw/main/android/GatedPulse.apk">Android app (.apk)</a>
+  <a style="color:var(--acc2)" href="https://raw.githubusercontent.com/cbake6807/PICO-SIGGEN-v1/main/android/GatedPulse.apk">Android app (.apk)</a>
   &middot; <a style="color:var(--acc2)" href="https://github.com/cbake6807/PICO-SIGGEN-v1/blob/main/android/README.md">how to install</a></p>
 </div>
 </main>
